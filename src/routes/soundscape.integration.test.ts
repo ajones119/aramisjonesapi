@@ -21,6 +21,7 @@ test("resolver rate limit rejects the 31st request before upstream work", async 
     placeCookieSecret: "test-place-secret",
     placeCooldownSeconds: 600,
     placeNetworkCap: 4,
+    placeAdminToken: undefined,
     typesafeApiKey: "test-key",
     supabaseUrl: "http://127.0.0.1:1",
     supabasePublishableKey: "test-key",

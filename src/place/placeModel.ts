@@ -52,6 +52,23 @@ export interface CooldownStatus {
   networkCap: number;
 }
 
+export const HISTORY_CAPACITY = 5_000;
+
+/** The pseudo-visitor that admin restorations are recorded under. */
+export const ADMIN_VISITOR = "admin";
+
+/** One entry in the Placement History. */
+export interface HistoryEntry {
+  x: number;
+  y: number;
+  color: number;
+  /** The color this Placement replaced, which a revert restores. */
+  previousColor: number;
+  visitorHash: string;
+  networkHash: string;
+  at: number;
+}
+
 export interface PlaceModel {
   place(message: unknown, identity: PlaceIdentity): PlacementResult;
   snapshot(visitorHash: string): CanvasSnapshot;
@@ -60,6 +77,16 @@ export interface PlaceModel {
   setCooldownSeconds(seconds: number): void;
   /** Ends the visitor's Cooldown and clears their network's Placement window. */
   resetCooldown(identity: PlaceIdentity): void;
+  /** Placement History, newest first. */
+  listPlacements(options: { limit: number; visitorHash?: string }): HistoryEntry[];
+  /**
+   * Undo a visitor's Placements made between `from` and `to` (inclusive). A Pixel
+   * is restored only where that visitor's Placement is still the latest one, to
+   * the color it had before their run of Placements on it. Returns the restored Pixels.
+   */
+  revert(visitorHash: string, from: number, to: number): Placement[];
+  /** Calls `listener` for every Pixel change, from visitors and from reverts. Returns an unsubscribe function. */
+  onPixelChange(listener: (placement: Placement) => void): () => void;
 }
 
 interface PlaceModelOptions {
@@ -77,6 +104,28 @@ export function createPlaceModel({
   const visitorCooldowns = new Map<string, number>();
   const networkPlacements = new Map<string, number[]>();
   let cooldownMs = initialCooldownMs;
+  const history: HistoryEntry[] = [];
+  const listeners = new Set<(placement: Placement) => void>();
+
+  function colorAt(x: number, y: number): number {
+    const index = y * CANVAS_WIDTH + x;
+    const byte = pixels[index >> 1];
+    return index & 1 ? byte & 0x0f : byte >> 4;
+  }
+
+  /** Paints a Pixel, records it in the Placement History, and tells listeners. */
+  function paint(placement: Placement, visitorHash: string, networkHash: string, at: number): void {
+    const { x, y, color } = placement;
+    const previousColor = colorAt(x, y);
+    const index = y * CANVAS_WIDTH + x;
+    const byte = index >> 1;
+    pixels[byte] = index & 1
+      ? (pixels[byte] & 0xf0) | color
+      : (pixels[byte] & 0x0f) | (color << 4);
+    history.push({ x, y, color, previousColor, visitorHash, networkHash, at });
+    if (history.length > HISTORY_CAPACITY) history.shift();
+    for (const listener of listeners) listener({ x, y, color });
+  }
 
   /** This network's Placement times inside the current Cooldown window, oldest first. */
   function recentPlacements(networkHash: string, serverNow: number): number[] {
@@ -122,11 +171,7 @@ export function createPlaceModel({
         };
       }
 
-      const index = y * CANVAS_WIDTH + x;
-      const byte = index >> 1;
-      pixels[byte] = index & 1
-        ? (pixels[byte] & 0xf0) | color
-        : (pixels[byte] & 0x0f) | (color << 4);
+      paint({ x, y, color }, identity.visitorHash, identity.networkHash, serverNow);
       const nextAllowedAt = serverNow + cooldownMs;
       visitorCooldowns.set(identity.visitorHash, nextAllowedAt);
       recent.push(serverNow);
@@ -160,6 +205,43 @@ export function createPlaceModel({
     resetCooldown({ visitorHash, networkHash }) {
       visitorCooldowns.delete(visitorHash);
       networkPlacements.delete(networkHash);
+    },
+    listPlacements({ limit, visitorHash }) {
+      const result: HistoryEntry[] = [];
+      for (let i = history.length - 1; i >= 0 && result.length < limit; i--) {
+        if (visitorHash === undefined || history[i].visitorHash === visitorHash) result.push({ ...history[i] });
+      }
+      return result;
+    },
+    revert(visitorHash, from, to) {
+      // Walk newest to oldest. A Pixel's first entry is its latest Placement; if
+      // it is the visitor's (in range), follow their unbroken run back to find
+      // the color from before it.
+      const restoreTo = new Map<number, number>();
+      const settled = new Set<number>();
+      for (let i = history.length - 1; i >= 0; i--) {
+        const entry = history[i];
+        const index = entry.y * CANVAS_WIDTH + entry.x;
+        if (settled.has(index)) continue;
+        const theirs = entry.visitorHash === visitorHash && entry.at >= from && entry.at <= to;
+        if (theirs) {
+          restoreTo.set(index, entry.previousColor);
+        } else {
+          settled.add(index);
+        }
+      }
+      const at = now();
+      const restored: Placement[] = [];
+      for (const [index, color] of restoreTo) {
+        const placement = { x: index % CANVAS_WIDTH, y: Math.floor(index / CANVAS_WIDTH), color };
+        paint(placement, ADMIN_VISITOR, ADMIN_VISITOR, at);
+        restored.push(placement);
+      }
+      return restored;
+    },
+    onPixelChange(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
     },
   };
 }

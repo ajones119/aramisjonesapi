@@ -18,8 +18,12 @@ export function createPlaceRoom(model: PlaceModel, cookieSecret: string) {
     }
 
     autoDispose = false;
+    private stopBroadcasting?: () => void;
 
     onCreate() {
+      // Every Pixel change reaches everyone this way, whether a visitor's Placement or an admin revert.
+      this.stopBroadcasting = model.onPixelChange((placement) => this.broadcast("placed", placement));
+
       this.onMessage("place", (client, message: unknown) => {
         const result = model.place(message, client.auth as PlaceIdentity);
         if (!result.accepted) {
@@ -34,8 +38,11 @@ export function createPlaceRoom(model: PlaceModel, cookieSecret: string) {
           nextAllowedAt: result.nextAllowedAt,
           serverNow: result.serverNow,
         });
-        this.broadcast("placed", result.placement);
       });
+    }
+
+    onDispose() {
+      this.stopBroadcasting?.();
     }
 
     onJoin(client: Client) {

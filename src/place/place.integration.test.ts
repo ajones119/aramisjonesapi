@@ -16,6 +16,7 @@ const testConfig = {
   placeCookieSecret: "test-place-secret",
   placeCooldownSeconds: 0,
   placeNetworkCap: 100,
+  placeAdminToken: undefined,
   supabaseUrl: "http://127.0.0.1:1",
   supabasePublishableKey: "test-key",
 } satisfies Config;
@@ -437,6 +438,152 @@ test("debug routes do not exist in production", async () => {
       const response = await app.inject({ method, url, headers: { cookie }, payload });
       assert.equal(response.statusCode, 404, `${method} ${url}`);
     }
+  } finally {
+    await app.close();
+  }
+});
+
+const ADMIN_TOKEN = "test-admin-token-0123456789";
+
+interface HistoryEntry {
+  x: number;
+  y: number;
+  color: number;
+  previousColor: number;
+  visitorHash: string;
+  networkHash: string;
+  at: number;
+}
+
+async function admin(app: Awaited<ReturnType<typeof buildApp>>, method: "GET" | "POST", url: string, payload?: unknown, token = ADMIN_TOKEN) {
+  return app.inject({ method, url, payload: payload as object | undefined, headers: token ? { authorization: `Bearer ${token}` } : {} });
+}
+
+async function visitorHashOf(endpoint: string, cookie: string) {
+  return (await debugRequest(endpoint, cookie, "GET", "")).body!.visitorHash;
+}
+
+async function placeAndWait(room: Room, x: number, y: number, color: number) {
+  const accepted = nextMessage(room, "place:accepted");
+  room.send("place", { x, y, color });
+  await accepted;
+}
+
+test("the Placement History keeps the latest 5,000 Placements, newest first", async () => {
+  let now = 1_700_000_000_000;
+  const { app, endpoint } = await startApi({ ...testConfig, placeAdminToken: ADMIN_TOKEN, placeNetworkCap: 100_000 }, () => now++);
+  try {
+    const { room, cookie } = await joinVisitor(endpoint);
+    const visitorHash = await visitorHashOf(endpoint, cookie);
+    const total = 5_001;
+    let accepted = 0;
+    const allAccepted = new Promise<void>(resolve => room.onMessage("place:accepted", () => {
+      if (++accepted === total) resolve();
+    }));
+    for (let i = 0; i < total; i++) room.send("place", { x: i % 128, y: Math.floor(i / 128), color: (i % 15) + 1 });
+    await allAccepted;
+
+    const response = await admin(app, "GET", "/place/admin/placements?limit=5000");
+    assert.equal(response.statusCode, 200);
+    const { placements } = response.json() as { placements: HistoryEntry[] };
+    assert.equal(placements.length, 5_000);
+    assert.deepEqual(
+      { ...placements[0], at: 0, networkHash: "" },
+      { x: 5_000 % 128, y: Math.floor(5_000 / 128), color: (5_000 % 15) + 1, previousColor: 0, visitorHash, networkHash: "", at: 0 },
+    );
+    const oldest = placements.at(-1)!;
+    assert.deepEqual([oldest.x, oldest.y], [1, 0], "the very first Placement was evicted");
+    assert.ok(placements[0].at > oldest.at);
+    assert.match(oldest.networkHash, /^[0-9a-f]{64}$/);
+
+    const limited = (await admin(app, "GET", "/place/admin/placements?limit=3")).json() as { placements: HistoryEntry[] };
+    assert.equal(limited.placements.length, 3);
+    assert.equal((await admin(app, "GET", "/place/admin/placements?limit=5001")).statusCode, 400);
+    await room.leave();
+  } finally {
+    await app.close();
+  }
+});
+
+test("revert restores only Pixels where the visitor is still on top, broadcasts them, and records them", async () => {
+  let now = 1_700_000_000_000;
+  const { app, endpoint } = await startApi({ ...testConfig, placeAdminToken: ADMIN_TOKEN }, () => now);
+  const rooms: Room[] = [];
+  try {
+    const vandal = await joinVisitor(endpoint);
+    const friend = await joinVisitor(endpoint);
+    const watcher = await joinVisitor(endpoint);
+    rooms.push(vandal.room, friend.room, watcher.room);
+    const vandalHash = await visitorHashOf(endpoint, vandal.cookie);
+
+    await placeAndWait(friend.room, 9, 9, 10);    // the friend's art: (9,9) is green
+    now += 1_000;
+    const from = now;
+    await placeAndWait(vandal.room, 1, 1, 5);     // (1,1) white -> red
+    await placeAndWait(vandal.room, 1, 1, 3);     // (1,1) red -> black, same vandal
+    await placeAndWait(vandal.room, 2, 2, 5);     // (2,2) white -> red, fixed by the friend below
+    await placeAndWait(vandal.room, 9, 9, 3);     // (9,9) green -> black
+    now += 1_000;
+    await placeAndWait(friend.room, 2, 2, 12);    // the friend fixes (2,2)
+    const to = now;
+    now += 60_000;
+    await placeAndWait(vandal.room, 4, 4, 5);     // outside the range: stays
+
+    const restoredPixels: { x: number; y: number; color: number }[] = [];
+    watcher.room.onMessage("placed", (message: { x: number; y: number; color: number }) => restoredPixels.push(message));
+    const response = await admin(app, "POST", "/place/admin/revert", { visitorHash: vandalHash, from, to });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), { restored: 2 });
+
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.deepEqual(
+      restoredPixels.sort((a, b) => a.x - b.x),
+      [{ x: 1, y: 1, color: 0 }, { x: 9, y: 9, color: 10 }],
+    );
+
+    const rejoin = await joinVisitor(endpoint);
+    rooms.push(rejoin.room);
+    const colorAt = (x: number, y: number) => {
+      const index = y * 128 + x;
+      const byte = rejoin.canvas.pixels[index >> 1];
+      return index & 1 ? byte & 0x0f : byte >> 4;
+    };
+    assert.deepEqual([colorAt(1, 1), colorAt(2, 2), colorAt(9, 9), colorAt(4, 4)], [0, 12, 10, 5]);
+
+    const { placements } = (await admin(app, "GET", "/place/admin/placements?limit=2")).json() as { placements: HistoryEntry[] };
+    assert.deepEqual(placements.map(entry => entry.visitorHash), ["admin", "admin"]);
+    assert.deepEqual(
+      placements.map(({ x, y, color, previousColor }) => ({ x, y, color, previousColor })).sort((a, b) => a.x - b.x),
+      [{ x: 1, y: 1, color: 0, previousColor: 3 }, { x: 9, y: 9, color: 10, previousColor: 3 }],
+    );
+
+    const filtered = (await admin(app, "GET", `/place/admin/placements?limit=50&visitorHash=${vandalHash}`)).json() as { placements: HistoryEntry[] };
+    assert.equal(filtered.placements.length, 5);
+    assert.ok(filtered.placements.every(entry => entry.visitorHash === vandalHash));
+  } finally {
+    await Promise.all(rooms.map(room => room.leave()));
+    await app.close();
+  }
+});
+
+test("admin routes reject a missing or wrong token", async () => {
+  const app = await buildApp({ ...testConfig, placeAdminToken: ADMIN_TOKEN }, { logger: false });
+  try {
+    for (const token of ["", "wrong", ADMIN_TOKEN.replace(/.$/, "x")]) {
+      assert.equal((await admin(app, "GET", "/place/admin/placements", undefined, token)).statusCode, 401, `token "${token}"`);
+      assert.equal((await admin(app, "POST", "/place/admin/revert", { visitorHash: "a".repeat(64) }, token)).statusCode, 401);
+    }
+    assert.equal((await admin(app, "GET", "/place/admin/placements")).statusCode, 200);
+  } finally {
+    await app.close();
+  }
+});
+
+test("admin routes do not exist without PLACE_ADMIN_TOKEN", async () => {
+  const app = await buildApp({ ...testConfig, placeAdminToken: undefined }, { logger: false });
+  try {
+    assert.equal((await admin(app, "GET", "/place/admin/placements")).statusCode, 404);
+    assert.equal((await admin(app, "POST", "/place/admin/revert", { visitorHash: "a".repeat(64) })).statusCode, 404);
   } finally {
     await app.close();
   }

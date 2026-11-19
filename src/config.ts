@@ -10,6 +10,8 @@ const environmentSchema = z.object({
   PLACE_COOKIE_SECRET: z.string().trim().min(1).optional(),
   PLACE_COOLDOWN_SECONDS: z.coerce.number().int().min(0).default(600),
   PLACE_NETWORK_CAP: z.coerce.number().int().positive().default(4),
+  // Admin routes exist only when this is set. Use a long random value (e.g. openssl rand -hex 32).
+  PLACE_ADMIN_TOKEN: z.string().trim().min(16).optional(),
   TYPESAFE_API_KEY: z.string().trim().min(1),
   SUPABASE_URL: z.string().trim().url(),
   SUPABASE_PUBLISHABLE_KEY: z.string().trim().min(1),
@@ -30,6 +32,7 @@ export const config = {
   placeCookieSecret: values.PLACE_COOKIE_SECRET ?? "development-only-place-cookie-secret",
   placeCooldownSeconds: values.PLACE_COOLDOWN_SECONDS,
   placeNetworkCap: values.PLACE_NETWORK_CAP,
+  placeAdminToken: values.PLACE_ADMIN_TOKEN,
   typesafeApiKey: values.TYPESAFE_API_KEY,
   supabaseUrl: values.SUPABASE_URL,
   supabasePublishableKey: values.SUPABASE_PUBLISHABLE_KEY,

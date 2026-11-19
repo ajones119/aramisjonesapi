@@ -13,6 +13,7 @@ import { config, type Config } from "./config.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerJevRoute } from "./routes/jev.js";
 import { createPlaceModel } from "./place/placeModel.js";
+import { registerPlaceAdminRoutes } from "./routes/placeAdmin.js";
 import { registerPlaceDebugRoutes } from "./routes/placeDebug.js";
 import { registerPlaceSessionRoute } from "./routes/placeSession.js";
 import { registerSoundscapeRoute } from "./routes/soundscape.js";
@@ -78,6 +79,9 @@ export async function buildApp(
     now,
   });
   await registerRealtime(app, runtimeConfig, placeModel);
+  if (runtimeConfig.placeAdminToken) {
+    await registerPlaceAdminRoutes(app, runtimeConfig.placeAdminToken, placeModel);
+  }
   if (runtimeConfig.nodeEnv === "development") {
     await registerPlaceDebugRoutes(app, runtimeConfig, placeModel);
   }
