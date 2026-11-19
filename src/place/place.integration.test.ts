@@ -42,11 +42,11 @@ function colorAt(canvas: CanvasSnapshot, x: number, y: number) {
   return (canvas.pixels[i] << 16) | (canvas.pixels[i + 1] << 8) | canvas.pixels[i + 2];
 }
 
-const R_PLACE_2017_PALETTE = [
-  "#FFFFFF", "#E4E4E4", "#888888", "#222222",
-  "#FFA7D1", "#E50000", "#E59500", "#A06A42",
-  "#E5D900", "#94E044", "#02BE01", "#00D3DD",
-  "#0083C7", "#0000EA", "#CF6EE4", "#820080",
+const EXPECTED_PALETTE = [
+  "#FFFFFF", "#D9E6E3", "#808080", "#1E2B2A",
+  "#9BE3D2", "#4A9D9D", "#336666", "#99CC99",
+  "#7FA7C9", "#FFCC99", "#E9B872", "#FF9966",
+  "#E58C8C", "#B5524F", "#996699", "#5B3F6E",
 ];
 
 /** Boots the API. Each call gets an empty data folder unless one is passed, so Canvases never leak between tests. */
@@ -99,7 +99,7 @@ test("a visitor joining Place receives the Palette and an all-white 128×128 Can
   try {
     const { room, canvas } = await joinVisitor(endpoint);
 
-    assert.deepEqual(canvas.palette, R_PLACE_2017_PALETTE);
+    assert.deepEqual(canvas.palette, EXPECTED_PALETTE);
     assert.equal(canvas.width, 128);
     assert.equal(canvas.height, 128);
     assert.equal(canvas.pixels.byteLength, 128 * 128 * 3);

@@ -1,8 +1,17 @@
 /**
- * The r/place 2017 Palette: the preset colors offered first. Visitors may also
- * place any other 24-bit color with the custom color picker.
+ * The Palette: the preset colors offered first, drawn from the soundscape page
+ * (mint, amber, coral) and the site's theme colors. Visitors may also place any
+ * other 24-bit color with the custom color picker.
  */
 export const PALETTE = [
+  "#FFFFFF", "#D9E6E3", "#808080", "#1E2B2A",
+  "#9BE3D2", "#4A9D9D", "#336666", "#99CC99",
+  "#7FA7C9", "#FFCC99", "#E9B872", "#FF9966",
+  "#E58C8C", "#B5524F", "#996699", "#5B3F6E",
+] as const;
+
+/** The r/place 2017 colors that version 1 save files index into. Only for upgrading those files. */
+export const LEGACY_PALETTE = [
   "#FFFFFF", "#E4E4E4", "#888888", "#222222",
   "#FFA7D1", "#E50000", "#E59500", "#A06A42",
   "#E5D900", "#94E044", "#02BE01", "#00D3DD",

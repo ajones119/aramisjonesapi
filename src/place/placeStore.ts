@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { CANVAS_HEIGHT, CANVAS_WIDTH, HISTORY_CAPACITY, MAX_COLOR, PALETTE, type PlaceModel, type PlaceSave } from "./placeModel.js";
+import { CANVAS_HEIGHT, CANVAS_WIDTH, HISTORY_CAPACITY, LEGACY_PALETTE, MAX_COLOR, type PlaceModel, type PlaceSave } from "./placeModel.js";
 
 /**
  * Interim disk persistence for Place (durable storage is a later ticket). The
@@ -40,11 +40,11 @@ function saveSchema<V extends number>(version: V, pixelBytes: number, maxColor: 
 }
 
 /** Version 1 stored 4-bit Palette indices, two Pixels per byte; version 2 stores any RGB color. */
-const v1Schema = saveSchema(1, CANVAS_WIDTH * CANVAS_HEIGHT / 2, PALETTE.length - 1);
+const v1Schema = saveSchema(1, CANVAS_WIDTH * CANVAS_HEIGHT / 2, LEGACY_PALETTE.length - 1);
 const v2Schema = saveSchema(2, CANVAS_WIDTH * CANVAS_HEIGHT * 3, MAX_COLOR);
 const anySave = z.discriminatedUnion("version", [v1Schema, v2Schema]);
 
-const paletteColor = (index: number) => Number.parseInt(PALETTE[index].slice(1), 16);
+const paletteColor = (index: number) => Number.parseInt(LEGACY_PALETTE[index].slice(1), 16);
 
 /** Turns a version 1 save's Palette indices into RGB colors. */
 function upgrade(save: z.infer<typeof anySave>): PlaceSave {
