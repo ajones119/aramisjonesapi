@@ -15,7 +15,11 @@ const JOIN_METHODS = ["join", "joinById", "reconnect"] as const;
  * Colyseus transport on Fastify's own HTTP server, and matchmaking is a Fastify
  * route so CORS and validation stay in one place.
  */
-export async function registerRealtime(app: FastifyInstance, config: Config): Promise<void> {
+export async function registerRealtime(
+  app: FastifyInstance,
+  config: Config,
+  now: () => number = Date.now,
+): Promise<void> {
   const transport = new WebSocketTransport({
     noServer: true,
     beforeUpgrade: (_request, context) => {
@@ -31,7 +35,11 @@ export async function registerRealtime(app: FastifyInstance, config: Config): Pr
   transport.attachToServer(app.server);
 
   await matchMaker.setup();
-  matchMaker.defineRoomType(PLACE_ROOM, createPlaceRoom(createPlaceModel()));
+  matchMaker.defineRoomType(PLACE_ROOM, createPlaceRoom(createPlaceModel({
+    cooldownMs: config.placeCooldownSeconds * 1_000,
+    networkCap: config.placeNetworkCap,
+    now,
+  }), config.placeCookieSecret));
   await matchMaker.accept();
   await matchMaker.createRoom(PLACE_ROOM, {});
 
@@ -46,11 +54,18 @@ export async function registerRealtime(app: FastifyInstance, config: Config): Pr
     async (request, reply) => {
       const { method, roomName } = request.params as { method: (typeof JOIN_METHODS)[number]; roomName: string };
       try {
+        const authContext = createAuthContext({
+          headers: request.headers as Record<string, string>,
+          remoteAddress: request.ip,
+        });
+        // Fastify has already applied TRUST_PROXY; do not let Colyseus reinterpret
+        // untrusted forwarding headers a second time.
+        authContext.ip = request.ip;
         return await matchMaker.controller.invokeMethod(
           method,
           roomName,
           (request.body as Record<string, unknown> | undefined) ?? {},
-          createAuthContext({ headers: request.headers as Record<string, string>, remoteAddress: request.ip }),
+          authContext,
         );
       } catch (error) {
         const code = (error as { code?: number }).code;

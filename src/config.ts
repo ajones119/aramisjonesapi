@@ -7,9 +7,15 @@ const environmentSchema = z.object({
   HOST: z.string().trim().min(1).default("0.0.0.0"),
   TRUST_PROXY: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   CORS_ORIGINS: z.string().default("http://localhost:4321,https://aramisjones.com,https://www.aramisjones.com"),
+  PLACE_COOKIE_SECRET: z.string().trim().min(1).optional(),
+  PLACE_COOLDOWN_SECONDS: z.coerce.number().int().min(0).default(600),
+  PLACE_NETWORK_CAP: z.coerce.number().int().positive().default(4),
   TYPESAFE_API_KEY: z.string().trim().min(1),
   SUPABASE_URL: z.string().trim().url(),
   SUPABASE_PUBLISHABLE_KEY: z.string().trim().min(1),
+}).refine((env) => env.NODE_ENV !== "production" || env.PLACE_COOKIE_SECRET !== undefined, {
+  path: ["PLACE_COOKIE_SECRET"],
+  message: "PLACE_COOKIE_SECRET is required in production",
 });
 
 const values = environmentSchema.parse(process.env);
@@ -21,6 +27,9 @@ export const config = {
   host: values.HOST,
   trustProxy: values.TRUST_PROXY,
   corsOrigins,
+  placeCookieSecret: values.PLACE_COOKIE_SECRET ?? "development-only-place-cookie-secret",
+  placeCooldownSeconds: values.PLACE_COOLDOWN_SECONDS,
+  placeNetworkCap: values.PLACE_NETWORK_CAP,
   typesafeApiKey: values.TYPESAFE_API_KEY,
   supabaseUrl: values.SUPABASE_URL,
   supabasePublishableKey: values.SUPABASE_PUBLISHABLE_KEY,

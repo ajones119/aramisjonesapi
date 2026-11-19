@@ -12,20 +12,26 @@ import {
 import { config, type Config } from "./config.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerJevRoute } from "./routes/jev.js";
+import { registerPlaceSessionRoute } from "./routes/placeSession.js";
 import { registerSoundscapeRoute } from "./routes/soundscape.js";
 import { registerRealtime } from "./realtime.js";
 
 export interface BuildAppOptions {
   logger?: boolean;
+  now?: () => number;
 }
 
-export async function buildApp(runtimeConfig: Config = config, { logger = true }: BuildAppOptions = {}) {
+export async function buildApp(
+  runtimeConfig: Config = config,
+  { logger = true, now = Date.now }: BuildAppOptions = {},
+) {
   const app = Fastify({ logger, trustProxy: runtimeConfig.trustProxy }).withTypeProvider<ZodTypeProvider>();
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
 
   await app.register(cors, {
+    credentials: true,
     origin: (origin, callback) => {
       if (!origin || runtimeConfig.corsOrigins.includes(origin)) {
         callback(null, true);
@@ -62,8 +68,9 @@ export async function buildApp(runtimeConfig: Config = config, { logger = true }
   });
 
   await registerHealthRoute(app);
+  await registerPlaceSessionRoute(app, runtimeConfig);
   await registerSoundscapeRoute(app, runtimeConfig);
-  await registerRealtime(app, runtimeConfig);
+  await registerRealtime(app, runtimeConfig, now);
   if (runtimeConfig.nodeEnv !== "production") {
     await registerJevRoute(app, runtimeConfig);
   }
