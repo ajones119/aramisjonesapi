@@ -12,6 +12,8 @@ import {
 import { config, type Config } from "./config.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerJevRoute } from "./routes/jev.js";
+import { createPlaceModel } from "./place/placeModel.js";
+import { registerPlaceDebugRoutes } from "./routes/placeDebug.js";
 import { registerPlaceSessionRoute } from "./routes/placeSession.js";
 import { registerSoundscapeRoute } from "./routes/soundscape.js";
 import { registerRealtime } from "./realtime.js";
@@ -70,7 +72,15 @@ export async function buildApp(
   await registerHealthRoute(app);
   await registerPlaceSessionRoute(app, runtimeConfig);
   await registerSoundscapeRoute(app, runtimeConfig);
-  await registerRealtime(app, runtimeConfig, now);
+  const placeModel = createPlaceModel({
+    cooldownMs: runtimeConfig.placeCooldownSeconds * 1_000,
+    networkCap: runtimeConfig.placeNetworkCap,
+    now,
+  });
+  await registerRealtime(app, runtimeConfig, placeModel);
+  if (runtimeConfig.nodeEnv === "development") {
+    await registerPlaceDebugRoutes(app, runtimeConfig, placeModel);
+  }
   if (runtimeConfig.nodeEnv !== "production") {
     await registerJevRoute(app, runtimeConfig);
   }

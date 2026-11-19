@@ -43,9 +43,23 @@ function isIndex(value: unknown, limit: number): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < limit;
 }
 
+/** What the server knows about one visitor's Cooldown and network, for the dev debug panel. */
+export interface CooldownStatus {
+  cooldownSeconds: number;
+  nextAllowedAt: number;
+  serverNow: number;
+  networkPlacements: number;
+  networkCap: number;
+}
+
 export interface PlaceModel {
   place(message: unknown, identity: PlaceIdentity): PlacementResult;
   snapshot(visitorHash: string): CanvasSnapshot;
+  cooldownStatus(identity: PlaceIdentity): CooldownStatus;
+  /** Changes the Cooldown length for Placements made from now on; running Cooldowns keep their end time. */
+  setCooldownSeconds(seconds: number): void;
+  /** Ends the visitor's Cooldown and clears their network's Placement window. */
+  resetCooldown(identity: PlaceIdentity): void;
 }
 
 interface PlaceModelOptions {
@@ -55,13 +69,24 @@ interface PlaceModelOptions {
 }
 
 export function createPlaceModel({
-  cooldownMs,
+  cooldownMs: initialCooldownMs,
   networkCap,
   now = Date.now,
 }: PlaceModelOptions): PlaceModel {
   const pixels = new Uint8Array(Math.ceil(CANVAS_WIDTH * CANVAS_HEIGHT / 2));
   const visitorCooldowns = new Map<string, number>();
   const networkPlacements = new Map<string, number[]>();
+  let cooldownMs = initialCooldownMs;
+
+  /** This network's Placement times inside the current Cooldown window, oldest first. */
+  function recentPlacements(networkHash: string, serverNow: number): number[] {
+    const recent = networkPlacements.get(networkHash) ?? [];
+    const cutoff = serverNow - cooldownMs;
+    let expired = 0;
+    while (expired < recent.length && recent[expired] <= cutoff) expired++;
+    if (expired) recent.splice(0, expired);
+    return recent;
+  }
 
   return {
     place(message, identity) {
@@ -87,11 +112,7 @@ export function createPlaceModel({
         };
       }
 
-      const recent = networkPlacements.get(identity.networkHash) ?? [];
-      const cutoff = serverNow - cooldownMs;
-      let expired = 0;
-      while (expired < recent.length && recent[expired] <= cutoff) expired++;
-      if (expired) recent.splice(0, expired);
+      const recent = recentPlacements(identity.networkHash, serverNow);
       if (recent.length >= networkCap) {
         return {
           accepted: false,
@@ -122,6 +143,23 @@ export function createPlaceModel({
         nextAllowedAt: visitorCooldowns.get(visitorHash) ?? serverNow,
         serverNow,
       };
+    },
+    cooldownStatus({ visitorHash, networkHash }) {
+      const serverNow = now();
+      return {
+        cooldownSeconds: cooldownMs / 1_000,
+        nextAllowedAt: Math.max(visitorCooldowns.get(visitorHash) ?? serverNow, serverNow),
+        serverNow,
+        networkPlacements: recentPlacements(networkHash, serverNow).length,
+        networkCap,
+      };
+    },
+    setCooldownSeconds(seconds) {
+      cooldownMs = seconds * 1_000;
+    },
+    resetCooldown({ visitorHash, networkHash }) {
+      visitorCooldowns.delete(visitorHash);
+      networkPlacements.delete(networkHash);
     },
   };
 }

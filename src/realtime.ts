@@ -3,7 +3,7 @@ import { WebSocketTransport } from "@colyseus/ws-transport";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { Config } from "./config.js";
-import { createPlaceModel } from "./place/placeModel.js";
+import type { PlaceModel } from "./place/placeModel.js";
 import { createPlaceRoom, PLACE_ROOM } from "./place/placeRoom.js";
 
 /** Room names visitors may join. Rooms are created by the server, never by matchmaking requests. */
@@ -18,7 +18,7 @@ const JOIN_METHODS = ["join", "joinById", "reconnect"] as const;
 export async function registerRealtime(
   app: FastifyInstance,
   config: Config,
-  now: () => number = Date.now,
+  placeModel: PlaceModel,
 ): Promise<void> {
   const transport = new WebSocketTransport({
     noServer: true,
@@ -35,11 +35,7 @@ export async function registerRealtime(
   transport.attachToServer(app.server);
 
   await matchMaker.setup();
-  matchMaker.defineRoomType(PLACE_ROOM, createPlaceRoom(createPlaceModel({
-    cooldownMs: config.placeCooldownSeconds * 1_000,
-    networkCap: config.placeNetworkCap,
-    now,
-  }), config.placeCookieSecret));
+  matchMaker.defineRoomType(PLACE_ROOM, createPlaceRoom(placeModel, config.placeCookieSecret));
   await matchMaker.accept();
   await matchMaker.createRoom(PLACE_ROOM, {});
 

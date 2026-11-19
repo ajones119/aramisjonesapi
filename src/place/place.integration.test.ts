@@ -333,3 +333,111 @@ test("matchmaking cannot create extra rooms", async () => {
     await app.close();
   }
 });
+
+interface DebugStatus {
+  visitorHash: string;
+  networkHash: string;
+  cooldownSeconds: number;
+  nextAllowedAt: number;
+  serverNow: number;
+  networkPlacements: number;
+  networkCap: number;
+}
+
+async function debugRequest(endpoint: string, cookie: string | undefined, method: string, path: string, body?: unknown) {
+  const response = await fetch(`${endpoint}/place/debug${path}`, {
+    method,
+    headers: {
+      ...(cookie ? { Cookie: cookie } : {}),
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return { status: response.status, body: response.status === 404 ? undefined : await response.json() as DebugStatus };
+}
+
+test("in development the debug routes show what the server sees about the visitor", async () => {
+  const now = 1_700_000_000_000;
+  const { app, endpoint } = await startApi({ ...testConfig, placeCooldownSeconds: 600, placeNetworkCap: 4 }, () => now);
+  try {
+    const { room, cookie } = await joinVisitor(endpoint);
+    const before = await debugRequest(endpoint, cookie, "GET", "");
+    assert.equal(before.status, 200);
+    assert.match(before.body!.visitorHash, /^[0-9a-f]{64}$/);
+    assert.match(before.body!.networkHash, /^[0-9a-f]{64}$/);
+    assert.equal(before.body!.visitorHash.includes(cookie.split("=")[1].split(".")[0]), false);
+    assert.deepEqual(
+      { ...before.body, visitorHash: undefined, networkHash: undefined },
+      { visitorHash: undefined, networkHash: undefined, cooldownSeconds: 600, nextAllowedAt: now, serverNow: now, networkPlacements: 0, networkCap: 4 },
+    );
+
+    const accepted = nextMessage(room, "place:accepted");
+    room.send("place", { x: 1, y: 1, color: 3 });
+    await accepted;
+    const after = await debugRequest(endpoint, cookie, "GET", "");
+    assert.equal(after.body!.nextAllowedAt, now + 600_000);
+    assert.equal(after.body!.networkPlacements, 1);
+    assert.equal(after.body!.visitorHash, before.body!.visitorHash);
+
+    assert.equal((await debugRequest(endpoint, undefined, "GET", "")).status, 401);
+    await room.leave();
+  } finally {
+    await app.close();
+  }
+});
+
+test("in development the Cooldown length can be changed for later Placements and a visitor's Cooldown reset", async () => {
+  const now = 1_700_000_000_000;
+  const { app, endpoint } = await startApi({ ...testConfig, placeCooldownSeconds: 600, placeNetworkCap: 1 }, () => now);
+  try {
+    const { room, cookie } = await joinVisitor(endpoint);
+    const first = nextMessage(room, "place:accepted");
+    room.send("place", { x: 1, y: 1, color: 3 });
+    await first;
+
+    const shortened = await debugRequest(endpoint, cookie, "POST", "/cooldown", { seconds: 5 });
+    assert.equal(shortened.status, 200);
+    assert.equal(shortened.body!.cooldownSeconds, 5);
+    assert.equal(shortened.body!.nextAllowedAt, now + 600_000, "the running Cooldown is unchanged");
+
+    const reset = await debugRequest(endpoint, cookie, "POST", "/reset");
+    assert.equal(reset.status, 200);
+    assert.equal(reset.body!.nextAllowedAt, now);
+    assert.equal(reset.body!.networkPlacements, 0, "reset also clears this network's window");
+
+    const second = nextMessage<{ nextAllowedAt: number; serverNow: number }>(room, "place:accepted");
+    room.send("place", { x: 2, y: 1, color: 3 });
+    assert.deepEqual(await second, { nextAllowedAt: now + 5_000, serverNow: now });
+
+    await debugRequest(endpoint, cookie, "POST", "/cooldown", { seconds: 0 });
+    await debugRequest(endpoint, cookie, "POST", "/reset");
+    const third = nextMessage<{ nextAllowedAt: number }>(room, "place:accepted");
+    room.send("place", { x: 3, y: 1, color: 3 });
+    assert.equal((await third).nextAllowedAt, now);
+
+    for (const seconds of [-1, 1.5, "10"]) {
+      assert.equal((await debugRequest(endpoint, cookie, "POST", "/cooldown", { seconds })).status, 400);
+    }
+    await room.leave();
+  } finally {
+    await app.close();
+  }
+});
+
+test("debug routes do not exist in production", async () => {
+  const app = await buildApp({ ...testConfig, nodeEnv: "production" }, { logger: false });
+  try {
+    const session = await app.inject({ method: "POST", url: "/place/session" });
+    const cookie = `${session.cookies[0].name}=${session.cookies[0].value}`;
+    for (const [method, url, payload] of [
+      ["GET", "/place/debug", undefined],
+      ["POST", "/place/debug/cooldown", { seconds: 0 }],
+      ["POST", "/place/debug/reset", undefined],
+    ] as const) {
+      const response = await app.inject({ method, url, headers: { cookie }, payload });
+      assert.equal(response.statusCode, 404, `${method} ${url}`);
+    }
+  } finally {
+    await app.close();
+  }
+});
