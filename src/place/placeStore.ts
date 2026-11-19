@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { CANVAS_HEIGHT, CANVAS_WIDTH, HISTORY_CAPACITY, PALETTE, type PlaceModel, type PlaceSave } from "./placeModel.js";
+import { CANVAS_HEIGHT, CANVAS_WIDTH, HISTORY_CAPACITY, MAX_COLOR, PALETTE, type PlaceModel, type PlaceSave } from "./placeModel.js";
 
 /**
  * Interim disk persistence for Place (durable storage is a later ticket). The
@@ -17,25 +17,56 @@ interface Log {
   warn(message: string): void;
 }
 
-const color = z.number().int().min(0).max(PALETTE.length - 1);
-const saveSchema = z.object({
-  version: z.literal(1),
-  width: z.literal(CANVAS_WIDTH),
-  height: z.literal(CANVAS_HEIGHT),
-  pixels: z.string().refine(
-    (value) => Buffer.from(value, "base64").byteLength === CANVAS_WIDTH * CANVAS_HEIGHT / 2,
-    "pixels must decode to the packed Canvas size",
-  ),
-  history: z.array(z.object({
-    x: z.number().int().min(0).max(CANVAS_WIDTH - 1),
-    y: z.number().int().min(0).max(CANVAS_HEIGHT - 1),
-    color,
-    previousColor: color,
-    visitorHash: z.string(),
-    networkHash: z.string(),
-    at: z.number(),
-  })).max(HISTORY_CAPACITY),
-});
+function saveSchema<V extends number>(version: V, pixelBytes: number, maxColor: number) {
+  const color = z.number().int().min(0).max(maxColor);
+  return z.object({
+    version: z.literal(version),
+    width: z.literal(CANVAS_WIDTH),
+    height: z.literal(CANVAS_HEIGHT),
+    pixels: z.string().refine(
+      (value) => Buffer.from(value, "base64").byteLength === pixelBytes,
+      "pixels must decode to the Canvas size",
+    ),
+    history: z.array(z.object({
+      x: z.number().int().min(0).max(CANVAS_WIDTH - 1),
+      y: z.number().int().min(0).max(CANVAS_HEIGHT - 1),
+      color,
+      previousColor: color,
+      visitorHash: z.string(),
+      networkHash: z.string(),
+      at: z.number(),
+    })).max(HISTORY_CAPACITY),
+  });
+}
+
+/** Version 1 stored 4-bit Palette indices, two Pixels per byte; version 2 stores any RGB color. */
+const v1Schema = saveSchema(1, CANVAS_WIDTH * CANVAS_HEIGHT / 2, PALETTE.length - 1);
+const v2Schema = saveSchema(2, CANVAS_WIDTH * CANVAS_HEIGHT * 3, MAX_COLOR);
+const anySave = z.discriminatedUnion("version", [v1Schema, v2Schema]);
+
+const paletteColor = (index: number) => Number.parseInt(PALETTE[index].slice(1), 16);
+
+/** Turns a version 1 save's Palette indices into RGB colors. */
+function upgrade(save: z.infer<typeof anySave>): PlaceSave {
+  if (save.version === 2) return save;
+  const packed = Buffer.from(save.pixels, "base64");
+  const rgb = Buffer.alloc(CANVAS_WIDTH * CANVAS_HEIGHT * 3);
+  for (let pixel = 0; pixel < CANVAS_WIDTH * CANVAS_HEIGHT; pixel++) {
+    const byte = packed[pixel >> 1];
+    const color = paletteColor(pixel & 1 ? byte & 0x0f : byte >> 4);
+    rgb.writeUIntBE(color, pixel * 3, 3);
+  }
+  return {
+    ...save,
+    version: 2,
+    pixels: rgb.toString("base64"),
+    history: save.history.map(entry => ({
+      ...entry,
+      color: paletteColor(entry.color),
+      previousColor: paletteColor(entry.previousColor),
+    })),
+  };
+}
 
 /**
  * Reads the saved Place. A missing file means a fresh Canvas. A corrupt one is
@@ -51,7 +82,7 @@ export async function loadPlace(dataDir: string, log: Log, now = Date.now): Prom
     throw error;
   }
   try {
-    const saved = saveSchema.parse(JSON.parse(text)) as PlaceSave;
+    const saved = upgrade(anySave.parse(JSON.parse(text)));
     log.info(`Loaded the Place Canvas and ${saved.history.length} Placement History entries from ${file}`);
     return saved;
   } catch (error) {

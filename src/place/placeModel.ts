@@ -1,4 +1,7 @@
-/** The r/place 2017 palette. Index 0 (white) is the empty-Canvas color. */
+/**
+ * The r/place 2017 Palette: the preset colors offered first. Visitors may also
+ * place any other 24-bit color with the custom color picker.
+ */
 export const PALETTE = [
   "#FFFFFF", "#E4E4E4", "#888888", "#222222",
   "#FFA7D1", "#E50000", "#E59500", "#A06A42",
@@ -9,11 +12,15 @@ export const PALETTE = [
 export const CANVAS_WIDTH = 128;
 export const CANVAS_HEIGHT = 128;
 
+/** Colors are 24-bit RGB numbers (0xRRGGBB). An empty Canvas is white. */
+export const WHITE = 0xFFFFFF;
+export const MAX_COLOR = 0xFFFFFF;
+
 export interface CanvasSnapshot {
   palette: readonly string[];
   width: number;
   height: number;
-  /** 4-bit Palette indices, two Pixels per byte (high nibble first), row-major. */
+  /** Three bytes (R, G, B) per Pixel, row-major. */
   pixels: Uint8Array;
   nextAllowedAt: number;
   serverNow: number;
@@ -71,10 +78,10 @@ export interface HistoryEntry {
 
 /** What survives a restart: the Canvas and Placement History, never Cooldowns. */
 export interface PlaceSave {
-  version: 1;
+  version: 2;
   width: number;
   height: number;
-  /** The packed Canvas, base64. */
+  /** The Canvas as RGB bytes, base64. */
   pixels: string;
   history: HistoryEntry[];
 }
@@ -116,7 +123,7 @@ export function createPlaceModel({
   now = Date.now,
   saved,
 }: PlaceModelOptions): PlaceModel {
-  const pixels = new Uint8Array(Math.ceil(CANVAS_WIDTH * CANVAS_HEIGHT / 2));
+  const pixels = new Uint8Array(CANVAS_WIDTH * CANVAS_HEIGHT * 3).fill(0xff);
   if (saved) pixels.set(Buffer.from(saved.pixels, "base64"));
   const visitorCooldowns = new Map<string, number>();
   const networkPlacements = new Map<string, number[]>();
@@ -126,20 +133,18 @@ export function createPlaceModel({
   const listeners = new Set<(placement: Placement) => void>();
 
   function colorAt(x: number, y: number): number {
-    const index = y * CANVAS_WIDTH + x;
-    const byte = pixels[index >> 1];
-    return index & 1 ? byte & 0x0f : byte >> 4;
+    const i = (y * CANVAS_WIDTH + x) * 3;
+    return (pixels[i] << 16) | (pixels[i + 1] << 8) | pixels[i + 2];
   }
 
   /** Paints a Pixel, records it in the Placement History, and tells listeners. */
   function paint(placement: Placement, visitorHash: string, networkHash: string, at: number): void {
     const { x, y, color } = placement;
     const previousColor = colorAt(x, y);
-    const index = y * CANVAS_WIDTH + x;
-    const byte = index >> 1;
-    pixels[byte] = index & 1
-      ? (pixels[byte] & 0xf0) | color
-      : (pixels[byte] & 0x0f) | (color << 4);
+    const i = (y * CANVAS_WIDTH + x) * 3;
+    pixels[i] = color >> 16;
+    pixels[i + 1] = (color >> 8) & 0xff;
+    pixels[i + 2] = color & 0xff;
     history.push({ x, y, color, previousColor, visitorHash, networkHash, at });
     if (history.length > HISTORY_CAPACITY) history.shift();
     changeCount++;
@@ -166,7 +171,7 @@ export function createPlaceModel({
       if (!isIndex(x, CANVAS_WIDTH) || !isIndex(y, CANVAS_HEIGHT)) {
         return { accepted: false, reason: "out_of_bounds", serverNow };
       }
-      if (!isIndex(color, PALETTE.length)) {
+      if (!isIndex(color, MAX_COLOR + 1)) {
         return { accepted: false, reason: "bad_color", serverNow };
       }
 
@@ -263,7 +268,7 @@ export function createPlaceModel({
     },
     serialize() {
       return {
-        version: 1,
+        version: 2,
         width: CANVAS_WIDTH,
         height: CANVAS_HEIGHT,
         pixels: Buffer.from(pixels).toString("base64"),

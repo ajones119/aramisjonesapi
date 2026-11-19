@@ -29,6 +29,19 @@ const testConfig = {
   supabasePublishableKey: "test-key",
 } satisfies Config;
 
+// Colors are 24-bit RGB numbers. CUSTOM is off the Palette, as the custom color picker allows.
+const WHITE = 0xFFFFFF;
+const BLACK = 0x222222;
+const RED = 0xE50000;
+const GREEN = 0x02BE01;
+const BLUE = 0x0083C7;
+const CUSTOM = 0x123456;
+
+function colorAt(canvas: CanvasSnapshot, x: number, y: number) {
+  const i = (y * 128 + x) * 3;
+  return (canvas.pixels[i] << 16) | (canvas.pixels[i + 1] << 8) | canvas.pixels[i + 2];
+}
+
 const R_PLACE_2017_PALETTE = [
   "#FFFFFF", "#E4E4E4", "#888888", "#222222",
   "#FFA7D1", "#E50000", "#E59500", "#A06A42",
@@ -89,8 +102,8 @@ test("a visitor joining Place receives the Palette and an all-white 128×128 Can
     assert.deepEqual(canvas.palette, R_PLACE_2017_PALETTE);
     assert.equal(canvas.width, 128);
     assert.equal(canvas.height, 128);
-    assert.equal(canvas.pixels.byteLength, 8192);
-    assert.ok(canvas.pixels.every((byte) => byte === 0), "every Pixel is Palette index 0 (white)");
+    assert.equal(canvas.pixels.byteLength, 128 * 128 * 3);
+    assert.ok(canvas.pixels.every((byte) => byte === 0xff), "every Pixel is white");
 
     await room.leave();
   } finally {
@@ -132,7 +145,7 @@ test("visitors see each accepted Placement and a fresh join gets the latest pack
   try {
     const { room: first } = await joinVisitor(endpoint);
     const { room: second } = await joinVisitor(endpoint);
-    for (const [placer, x, color] of [[first, 0, 1], [second, 1, 3], [second, 0, 5]] as const) {
+    for (const [placer, x, color] of [[first, 0, 0xE4E4E4], [second, 1, BLACK], [second, 0, CUSTOM]] as const) {
       const pixel = { x, y: 0, color };
       const replies = Promise.all([
         nextMessage<{ nextAllowedAt: number; serverNow: number }>(placer, "place:accepted"),
@@ -145,7 +158,7 @@ test("visitors see each accepted Placement and a fresh join gets the latest pack
       assert.deepEqual(b, pixel);
     }
     const { room, canvas } = await joinVisitor(endpoint);
-    assert.equal(canvas.pixels[0], 0x53);
+    assert.deepEqual([colorAt(canvas, 0, 0), colorAt(canvas, 1, 0)], [CUSTOM, BLACK]);
     await Promise.all([first.leave(), second.leave(), room.leave()]);
   } finally {
     await app.close();
@@ -285,15 +298,15 @@ test("invalid Placements return a reason without changing or broadcasting a Pixe
     placer.onMessage("placed", message => updates.push(message));
     for (const [x, y, color, reason] of [
       [-1, 1, 5, "out_of_bounds"], [128, 0, 5, "out_of_bounds"], [0, 128, 5, "out_of_bounds"],
-      [1.5, 0, 5, "out_of_bounds"], [1, 0, 16, "bad_color"], [1, 0, -1, "bad_color"],
-      [1, 0, 1.5, "bad_color"], [1, 0, "5", "bad_color"],
+      [1.5, 0, 5, "out_of_bounds"], [1, 0, 0x1000000, "bad_color"], [1, 0, -1, "bad_color"],
+      [1, 0, 1.5, "bad_color"], [1, 0, "5", "bad_color"], [1, 0, "#FF0000", "bad_color"],
     ] as const) {
       const reply = nextMessage<{ reason: string }>(placer, "place:rejected");
       placer.send("place", { x, y, color });
       assert.equal((await reply).reason, reason);
     }
     const { room, canvas } = await joinVisitor(endpoint);
-    assert.ok(canvas.pixels.every(byte => byte === 0));
+    assert.ok(canvas.pixels.every(byte => byte === 0xff));
     assert.deepEqual(updates, []);
     await Promise.all([placer.leave(), room.leave()]);
   } finally {
@@ -499,7 +512,7 @@ test("the Placement History keeps the latest 5,000 Placements, newest first", as
     assert.equal(placements.length, 5_000);
     assert.deepEqual(
       { ...placements[0], at: 0, networkHash: "" },
-      { x: 5_000 % 128, y: Math.floor(5_000 / 128), color: (5_000 % 15) + 1, previousColor: 0, visitorHash, networkHash: "", at: 0 },
+      { x: 5_000 % 128, y: Math.floor(5_000 / 128), color: (5_000 % 15) + 1, previousColor: WHITE, visitorHash, networkHash: "", at: 0 },
     );
     const oldest = placements.at(-1)!;
     assert.deepEqual([oldest.x, oldest.y], [1, 0], "the very first Placement was evicted");
@@ -526,18 +539,18 @@ test("revert restores only Pixels where the visitor is still on top, broadcasts 
     rooms.push(vandal.room, friend.room, watcher.room);
     const vandalHash = await visitorHashOf(endpoint, vandal.cookie);
 
-    await placeAndWait(friend.room, 9, 9, 10);    // the friend's art: (9,9) is green
+    await placeAndWait(friend.room, 9, 9, GREEN);  // the friend's art: (9,9) is green
     now += 1_000;
     const from = now;
-    await placeAndWait(vandal.room, 1, 1, 5);     // (1,1) white -> red
-    await placeAndWait(vandal.room, 1, 1, 3);     // (1,1) red -> black, same vandal
-    await placeAndWait(vandal.room, 2, 2, 5);     // (2,2) white -> red, fixed by the friend below
-    await placeAndWait(vandal.room, 9, 9, 3);     // (9,9) green -> black
+    await placeAndWait(vandal.room, 1, 1, RED);    // (1,1) white -> red
+    await placeAndWait(vandal.room, 1, 1, BLACK);  // (1,1) red -> black, same vandal
+    await placeAndWait(vandal.room, 2, 2, RED);    // (2,2) white -> red, fixed by the friend below
+    await placeAndWait(vandal.room, 9, 9, BLACK);  // (9,9) green -> black
     now += 1_000;
-    await placeAndWait(friend.room, 2, 2, 12);    // the friend fixes (2,2)
+    await placeAndWait(friend.room, 2, 2, BLUE);   // the friend fixes (2,2)
     const to = now;
     now += 60_000;
-    await placeAndWait(vandal.room, 4, 4, 5);     // outside the range: stays
+    await placeAndWait(vandal.room, 4, 4, RED);    // outside the range: stays
 
     const restoredPixels: { x: number; y: number; color: number }[] = [];
     watcher.room.onMessage("placed", (message: { x: number; y: number; color: number }) => restoredPixels.push(message));
@@ -548,23 +561,19 @@ test("revert restores only Pixels where the visitor is still on top, broadcasts 
     await new Promise(resolve => setTimeout(resolve, 100));
     assert.deepEqual(
       restoredPixels.sort((a, b) => a.x - b.x),
-      [{ x: 1, y: 1, color: 0 }, { x: 9, y: 9, color: 10 }],
+      [{ x: 1, y: 1, color: WHITE }, { x: 9, y: 9, color: GREEN }],
     );
 
     const rejoin = await joinVisitor(endpoint);
     rooms.push(rejoin.room);
-    const colorAt = (x: number, y: number) => {
-      const index = y * 128 + x;
-      const byte = rejoin.canvas.pixels[index >> 1];
-      return index & 1 ? byte & 0x0f : byte >> 4;
-    };
-    assert.deepEqual([colorAt(1, 1), colorAt(2, 2), colorAt(9, 9), colorAt(4, 4)], [0, 12, 10, 5]);
+    const at = (x: number, y: number) => colorAt(rejoin.canvas, x, y);
+    assert.deepEqual([at(1, 1), at(2, 2), at(9, 9), at(4, 4)], [WHITE, BLUE, GREEN, RED]);
 
     const { placements } = (await admin(app, "GET", "/place/admin/placements?limit=2")).json() as { placements: HistoryEntry[] };
     assert.deepEqual(placements.map(entry => entry.visitorHash), ["admin", "admin"]);
     assert.deepEqual(
       placements.map(({ x, y, color, previousColor }) => ({ x, y, color, previousColor })).sort((a, b) => a.x - b.x),
-      [{ x: 1, y: 1, color: 0, previousColor: 3 }, { x: 9, y: 9, color: 10, previousColor: 3 }],
+      [{ x: 1, y: 1, color: WHITE, previousColor: BLACK }, { x: 9, y: 9, color: GREEN, previousColor: BLACK }],
     );
 
     const filtered = (await admin(app, "GET", `/place/admin/placements?limit=50&visitorHash=${vandalHash}`)).json() as { placements: HistoryEntry[] };
@@ -599,10 +608,10 @@ test("admin routes do not exist without PLACE_ADMIN_TOKEN", async () => {
   }
 });
 
-function colorAt(canvas: CanvasSnapshot, x: number, y: number) {
-  const index = y * 128 + x;
-  const byte = canvas.pixels[index >> 1];
-  return index & 1 ? byte & 0x0f : byte >> 4;
+function nonWhitePixels(canvas: CanvasSnapshot) {
+  let count = 0;
+  for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) if (colorAt(canvas, x, y) !== WHITE) count++;
+  return count;
 }
 
 test("the Canvas and Placement History survive a restart, but Cooldowns do not", async () => {
@@ -615,9 +624,9 @@ test("the Canvas and Placement History survive a restart, but Cooldowns do not",
   try {
     const visitor = await joinVisitor(first.endpoint);
     cookie = visitor.cookie;
-    await placeAndWait(visitor.room, 3, 0, 5);  // high nibble of byte 1
+    await placeAndWait(visitor.room, 3, 0, CUSTOM);
     const other = await joinVisitor(first.endpoint);
-    await placeAndWait(other.room, 127, 127, 13); // low nibble of the last byte
+    await placeAndWait(other.room, 127, 127, BLUE); // the last Pixel
     await Promise.all([visitor.room.leave(), other.room.leave()]);
   } finally {
     await first.app.close();
@@ -627,15 +636,15 @@ test("the Canvas and Placement History survive a restart, but Cooldowns do not",
   const second = await startApi(config, () => now, dataDir);
   try {
     const { room, canvas } = await joinVisitor(second.endpoint, { cookie: cookie! });
-    assert.equal(colorAt(canvas, 3, 0), 5);
-    assert.equal(colorAt(canvas, 127, 127), 13);
-    assert.equal(canvas.pixels.filter(byte => byte !== 0).length, 2);
+    assert.equal(colorAt(canvas, 3, 0), CUSTOM);
+    assert.equal(colorAt(canvas, 127, 127), BLUE);
+    assert.equal(nonWhitePixels(canvas), 2);
     assert.equal(canvas.nextAllowedAt, now, "the Cooldown was cleared by the restart");
 
     const { placements } = (await admin(second.app, "GET", "/place/admin/placements")).json() as { placements: HistoryEntry[] };
     assert.deepEqual(placements.map(({ x, y, color, previousColor, at }) => ({ x, y, color, previousColor, at })), [
-      { x: 127, y: 127, color: 13, previousColor: 0, at: now },
-      { x: 3, y: 0, color: 5, previousColor: 0, at: now },
+      { x: 127, y: 127, color: BLUE, previousColor: WHITE, at: now },
+      { x: 3, y: 0, color: CUSTOM, previousColor: WHITE, at: now },
     ]);
 
     // History restored from disk still drives revert.
@@ -655,14 +664,14 @@ test("an unchanged Canvas is not rewritten on shutdown", async () => {
 });
 
 test("a corrupt save file is kept aside and Place boots with an empty Canvas", async () => {
-  const wrongShape = JSON.stringify({ version: 1, width: 128, height: 128, pixels: "AAAA", history: [] });
+  const wrongShape = JSON.stringify({ version: 2, width: 128, height: 128, pixels: "AAAA", history: [] });
   for (const contents of ["{ not json", wrongShape]) {
     const dataDir = newDataDir();
     writeFileSync(join(dataDir, "place.json"), contents);
     const { app, endpoint } = await startApi(testConfig, Date.now, dataDir);
     try {
       const { room, canvas } = await joinVisitor(endpoint);
-      assert.ok(canvas.pixels.every(byte => byte === 0));
+      assert.ok(canvas.pixels.every(byte => byte === 0xff));
       await room.leave();
     } finally {
       await app.close();
@@ -671,5 +680,25 @@ test("a corrupt save file is kept aside and Place boots with an empty Canvas", a
     const kept = files.find(name => name.startsWith("place.json.corrupt-"));
     assert.ok(kept, `corrupt file kept aside: ${files.join(", ")}`);
     assert.equal(readFileSync(join(dataDir, kept), "utf8"), contents);
+  }
+});
+
+test("a save file from the 16-color Palette era loads with its Palette indices turned into colors", async () => {
+  const dataDir = newDataDir();
+  const packed = new Uint8Array(128 * 128 / 2);
+  packed[0] = 0x5d; // (0,0) is index 5 (red), (1,0) is index 13 (blue)
+  writeFileSync(join(dataDir, "place.json"), JSON.stringify({
+    version: 1, width: 128, height: 128, pixels: Buffer.from(packed).toString("base64"),
+    history: [{ x: 0, y: 0, color: 5, previousColor: 0, visitorHash: "a".repeat(64), networkHash: "b".repeat(64), at: 1 }],
+  }));
+  const { app, endpoint } = await startApi({ ...testConfig, placeAdminToken: ADMIN_TOKEN }, Date.now, dataDir);
+  try {
+    const { room, canvas } = await joinVisitor(endpoint);
+    assert.deepEqual([colorAt(canvas, 0, 0), colorAt(canvas, 1, 0), colorAt(canvas, 2, 0)], [RED, 0x0000EA, WHITE]);
+    const { placements } = (await admin(app, "GET", "/place/admin/placements")).json() as { placements: HistoryEntry[] };
+    assert.deepEqual(placements.map(({ color, previousColor }) => ({ color, previousColor })), [{ color: RED, previousColor: WHITE }]);
+    await room.leave();
+  } finally {
+    await app.close();
   }
 });
