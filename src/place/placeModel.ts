@@ -69,6 +69,16 @@ export interface HistoryEntry {
   at: number;
 }
 
+/** What survives a restart: the Canvas and Placement History, never Cooldowns. */
+export interface PlaceSave {
+  version: 1;
+  width: number;
+  height: number;
+  /** The packed Canvas, base64. */
+  pixels: string;
+  history: HistoryEntry[];
+}
+
 export interface PlaceModel {
   place(message: unknown, identity: PlaceIdentity): PlacementResult;
   snapshot(visitorHash: string): CanvasSnapshot;
@@ -87,24 +97,32 @@ export interface PlaceModel {
   revert(visitorHash: string, from: number, to: number): Placement[];
   /** Calls `listener` for every Pixel change, from visitors and from reverts. Returns an unsubscribe function. */
   onPixelChange(listener: (placement: Placement) => void): () => void;
+  /** Counts Pixel changes, so a saver can tell whether anything is unsaved. */
+  readonly changeCount: number;
+  serialize(): PlaceSave;
 }
 
 interface PlaceModelOptions {
   cooldownMs: number;
   networkCap: number;
   now?: () => number;
+  /** A previously saved Canvas and Placement History to start from. */
+  saved?: PlaceSave;
 }
 
 export function createPlaceModel({
   cooldownMs: initialCooldownMs,
   networkCap,
   now = Date.now,
+  saved,
 }: PlaceModelOptions): PlaceModel {
   const pixels = new Uint8Array(Math.ceil(CANVAS_WIDTH * CANVAS_HEIGHT / 2));
+  if (saved) pixels.set(Buffer.from(saved.pixels, "base64"));
   const visitorCooldowns = new Map<string, number>();
   const networkPlacements = new Map<string, number[]>();
   let cooldownMs = initialCooldownMs;
-  const history: HistoryEntry[] = [];
+  const history: HistoryEntry[] = saved ? saved.history.slice(-HISTORY_CAPACITY) : [];
+  let changeCount = 0;
   const listeners = new Set<(placement: Placement) => void>();
 
   function colorAt(x: number, y: number): number {
@@ -124,6 +142,7 @@ export function createPlaceModel({
       : (pixels[byte] & 0x0f) | (color << 4);
     history.push({ x, y, color, previousColor, visitorHash, networkHash, at });
     if (history.length > HISTORY_CAPACITY) history.shift();
+    changeCount++;
     for (const listener of listeners) listener({ x, y, color });
   }
 
@@ -238,6 +257,18 @@ export function createPlaceModel({
         restored.push(placement);
       }
       return restored;
+    },
+    get changeCount() {
+      return changeCount;
+    },
+    serialize() {
+      return {
+        version: 1,
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
+        pixels: Buffer.from(pixels).toString("base64"),
+        history: history.map(entry => ({ ...entry })),
+      };
     },
     onPixelChange(listener) {
       listeners.add(listener);

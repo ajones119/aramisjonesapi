@@ -1,3 +1,6 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import Fastify from "fastify";
@@ -22,6 +25,7 @@ test("resolver rate limit rejects the 31st request before upstream work", async 
     placeCooldownSeconds: 600,
     placeNetworkCap: 4,
     placeAdminToken: undefined,
+    placeDataDir: mkdtempSync(join(tmpdir(), "soundscape-test-")),
     typesafeApiKey: "test-key",
     supabaseUrl: "http://127.0.0.1:1",
     supabasePublishableKey: "test-key",

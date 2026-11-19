@@ -13,6 +13,7 @@ import { config, type Config } from "./config.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerJevRoute } from "./routes/jev.js";
 import { createPlaceModel } from "./place/placeModel.js";
+import { loadPlace, startPlaceSaver } from "./place/placeStore.js";
 import { registerPlaceAdminRoutes } from "./routes/placeAdmin.js";
 import { registerPlaceDebugRoutes } from "./routes/placeDebug.js";
 import { registerPlaceSessionRoute } from "./routes/placeSession.js";
@@ -77,7 +78,10 @@ export async function buildApp(
     cooldownMs: runtimeConfig.placeCooldownSeconds * 1_000,
     networkCap: runtimeConfig.placeNetworkCap,
     now,
+    saved: await loadPlace(runtimeConfig.placeDataDir, app.log, now),
   });
+  const placeSaver = startPlaceSaver(placeModel, runtimeConfig.placeDataDir, app.log);
+  app.addHook("onClose", () => placeSaver.flush());
   await registerRealtime(app, runtimeConfig, placeModel);
   if (runtimeConfig.placeAdminToken) {
     await registerPlaceAdminRoutes(app, runtimeConfig.placeAdminToken, placeModel);

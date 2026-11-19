@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { Client, type Room } from "@colyseus/sdk";
 import WebSocket from "ws";
 import { buildApp } from "../app.js";
 import type { Config } from "../config.js";
 import type { CanvasSnapshot } from "./placeModel.js";
+
+function newDataDir() {
+  return mkdtempSync(join(tmpdir(), "place-test-"));
+}
 
 const testConfig = {
   nodeEnv: "development",
@@ -17,6 +24,7 @@ const testConfig = {
   placeCooldownSeconds: 0,
   placeNetworkCap: 100,
   placeAdminToken: undefined,
+  placeDataDir: newDataDir(),
   supabaseUrl: "http://127.0.0.1:1",
   supabasePublishableKey: "test-key",
 } satisfies Config;
@@ -28,11 +36,13 @@ const R_PLACE_2017_PALETTE = [
   "#0083C7", "#0000EA", "#CF6EE4", "#820080",
 ];
 
+/** Boots the API. Each call gets an empty data folder unless one is passed, so Canvases never leak between tests. */
 async function startApi(
   runtimeConfig: Config = testConfig,
   now: () => number = Date.now,
+  placeDataDir = newDataDir(),
 ) {
-  const app = await buildApp(runtimeConfig, { logger: false, now });
+  const app = await buildApp({ ...runtimeConfig, placeDataDir }, { logger: false, now });
   await app.listen({ host: "127.0.0.1", port: 0 });
   const address = app.server.address();
   if (!address || typeof address === "string") throw new Error("API did not bind a port");
@@ -586,5 +596,80 @@ test("admin routes do not exist without PLACE_ADMIN_TOKEN", async () => {
     assert.equal((await admin(app, "POST", "/place/admin/revert", { visitorHash: "a".repeat(64) })).statusCode, 404);
   } finally {
     await app.close();
+  }
+});
+
+function colorAt(canvas: CanvasSnapshot, x: number, y: number) {
+  const index = y * 128 + x;
+  const byte = canvas.pixels[index >> 1];
+  return index & 1 ? byte & 0x0f : byte >> 4;
+}
+
+test("the Canvas and Placement History survive a restart, but Cooldowns do not", async () => {
+  const dataDir = newDataDir();
+  const now = 1_700_000_000_000;
+  const config = { ...testConfig, placeCooldownSeconds: 600, placeAdminToken: ADMIN_TOKEN };
+
+  const first = await startApi(config, () => now, dataDir);
+  let cookie: string;
+  try {
+    const visitor = await joinVisitor(first.endpoint);
+    cookie = visitor.cookie;
+    await placeAndWait(visitor.room, 3, 0, 5);  // high nibble of byte 1
+    const other = await joinVisitor(first.endpoint);
+    await placeAndWait(other.room, 127, 127, 13); // low nibble of the last byte
+    await Promise.all([visitor.room.leave(), other.room.leave()]);
+  } finally {
+    await first.app.close();
+  }
+  assert.deepEqual(readdirSync(dataDir), ["place.json"], "saved by rename, with no temp file left behind");
+
+  const second = await startApi(config, () => now, dataDir);
+  try {
+    const { room, canvas } = await joinVisitor(second.endpoint, { cookie: cookie! });
+    assert.equal(colorAt(canvas, 3, 0), 5);
+    assert.equal(colorAt(canvas, 127, 127), 13);
+    assert.equal(canvas.pixels.filter(byte => byte !== 0).length, 2);
+    assert.equal(canvas.nextAllowedAt, now, "the Cooldown was cleared by the restart");
+
+    const { placements } = (await admin(second.app, "GET", "/place/admin/placements")).json() as { placements: HistoryEntry[] };
+    assert.deepEqual(placements.map(({ x, y, color, previousColor, at }) => ({ x, y, color, previousColor, at })), [
+      { x: 127, y: 127, color: 13, previousColor: 0, at: now },
+      { x: 3, y: 0, color: 5, previousColor: 0, at: now },
+    ]);
+
+    // History restored from disk still drives revert.
+    const revert = await admin(second.app, "POST", "/place/admin/revert", { visitorHash: placements[1].visitorHash });
+    assert.deepEqual(revert.json(), { restored: 1 });
+    await room.leave();
+  } finally {
+    await second.app.close();
+  }
+});
+
+test("an unchanged Canvas is not rewritten on shutdown", async () => {
+  const dataDir = newDataDir();
+  const { app } = await startApi(testConfig, Date.now, dataDir);
+  await app.close();
+  assert.deepEqual(readdirSync(dataDir), []);
+});
+
+test("a corrupt save file is kept aside and Place boots with an empty Canvas", async () => {
+  const wrongShape = JSON.stringify({ version: 1, width: 128, height: 128, pixels: "AAAA", history: [] });
+  for (const contents of ["{ not json", wrongShape]) {
+    const dataDir = newDataDir();
+    writeFileSync(join(dataDir, "place.json"), contents);
+    const { app, endpoint } = await startApi(testConfig, Date.now, dataDir);
+    try {
+      const { room, canvas } = await joinVisitor(endpoint);
+      assert.ok(canvas.pixels.every(byte => byte === 0));
+      await room.leave();
+    } finally {
+      await app.close();
+    }
+    const files = readdirSync(dataDir);
+    const kept = files.find(name => name.startsWith("place.json.corrupt-"));
+    assert.ok(kept, `corrupt file kept aside: ${files.join(", ")}`);
+    assert.equal(readFileSync(join(dataDir, kept), "utf8"), contents);
   }
 });
