@@ -1,7 +1,10 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { CANVAS_HEIGHT, CANVAS_WIDTH, HISTORY_CAPACITY, LEGACY_PALETTE, MAX_COLOR, type PlaceModel, type PlaceSave } from "./placeModel.js";
+import {
+  CANVAS_HEIGHT, CANVAS_WIDTH, EMPTY, HISTORY_CAPACITY, LEGACY_PALETTE, MAX_COLOR, WHITE,
+  type HistoryEntry, type PlaceModel, type PlaceSave,
+} from "./placeModel.js";
 
 /**
  * Interim disk persistence for Place (durable storage is a later ticket). The
@@ -17,19 +20,20 @@ interface Log {
   warn(message: string): void;
 }
 
-function saveSchema<V extends number>(version: V, pixelBytes: number, maxColor: number) {
-  const color = z.number().int().min(0).max(maxColor);
+function saveSchema<V extends number>(version: V, size: number, bytesPerPixel: number, minColor: number, maxColor: number) {
+  const color = z.number().int().min(minColor).max(maxColor);
+  const pixelBytes = size * size * bytesPerPixel;
   return z.object({
     version: z.literal(version),
-    width: z.literal(CANVAS_WIDTH),
-    height: z.literal(CANVAS_HEIGHT),
+    width: z.literal(size),
+    height: z.literal(size),
     pixels: z.string().refine(
       (value) => Buffer.from(value, "base64").byteLength === pixelBytes,
       "pixels must decode to the Canvas size",
     ),
     history: z.array(z.object({
-      x: z.number().int().min(0).max(CANVAS_WIDTH - 1),
-      y: z.number().int().min(0).max(CANVAS_HEIGHT - 1),
+      x: z.number().int().min(0).max(size - 1),
+      y: z.number().int().min(0).max(size - 1),
       color,
       previousColor: color,
       visitorHash: z.string(),
@@ -39,31 +43,56 @@ function saveSchema<V extends number>(version: V, pixelBytes: number, maxColor: 
   });
 }
 
-/** Version 1 stored 4-bit Palette indices, two Pixels per byte; version 2 stores any RGB color. */
-const v1Schema = saveSchema(1, CANVAS_WIDTH * CANVAS_HEIGHT / 2, LEGACY_PALETTE.length - 1);
-const v2Schema = saveSchema(2, CANVAS_WIDTH * CANVAS_HEIGHT * 3, MAX_COLOR);
-const anySave = z.discriminatedUnion("version", [v1Schema, v2Schema]);
+/**
+ * Save file versions:
+ * 1. 128×128, 4-bit indices into the r/place 2017 colors, two Pixels per byte.
+ * 2. 128×128, RGB (three bytes per Pixel); white doubled as "unpainted".
+ * 3. 256×256, RGBA (four bytes per Pixel); alpha 0 is an empty Pixel.
+ */
+const OLD_SIZE = 128;
+const v1Schema = saveSchema(1, OLD_SIZE, 0.5, 0, LEGACY_PALETTE.length - 1);
+const v2Schema = saveSchema(2, OLD_SIZE, 3, 0, MAX_COLOR);
+const v3Schema = saveSchema(3, CANVAS_WIDTH, 4, EMPTY, MAX_COLOR);
+const anySave = z.discriminatedUnion("version", [v1Schema, v2Schema, v3Schema]);
 
 const paletteColor = (index: number) => Number.parseInt(LEGACY_PALETTE[index].slice(1), 16);
 
-/** Turns a version 1 save's Palette indices into RGB colors. */
+/**
+ * Brings an older save up to version 3: one color per Pixel, white as empty
+ * (it was the old background, indistinguishable from unpainted), placed in the
+ * center of the larger Canvas with Placement History moved to match.
+ */
 function upgrade(save: z.infer<typeof anySave>): PlaceSave {
-  if (save.version === 2) return save;
-  const packed = Buffer.from(save.pixels, "base64");
-  const rgb = Buffer.alloc(CANVAS_WIDTH * CANVAS_HEIGHT * 3);
-  for (let pixel = 0; pixel < CANVAS_WIDTH * CANVAS_HEIGHT; pixel++) {
-    const byte = packed[pixel >> 1];
-    const color = paletteColor(pixel & 1 ? byte & 0x0f : byte >> 4);
-    rgb.writeUIntBE(color, pixel * 3, 3);
+  if (save.version === 3) return save;
+  const old = Buffer.from(save.pixels, "base64");
+  const oldColorAt = save.version === 1
+    ? (pixel: number) => paletteColor(pixel & 1 ? old[pixel >> 1] & 0x0f : old[pixel >> 1] >> 4)
+    : (pixel: number) => old.readUIntBE(pixel * 3, 3);
+  const asEmpty = (color: number) => (color === WHITE ? EMPTY : color);
+  const toColor = save.version === 1 ? (index: number) => asEmpty(paletteColor(index)) : asEmpty;
+
+  const offset = (CANVAS_WIDTH - OLD_SIZE) / 2;
+  const rgba = Buffer.alloc(CANVAS_WIDTH * CANVAS_HEIGHT * 4);
+  for (let y = 0; y < OLD_SIZE; y++) {
+    for (let x = 0; x < OLD_SIZE; x++) {
+      const color = asEmpty(oldColorAt(y * OLD_SIZE + x));
+      if (color === EMPTY) continue;
+      const i = ((y + offset) * CANVAS_WIDTH + x + offset) * 4;
+      rgba.writeUIntBE(color, i, 3);
+      rgba[i + 3] = 0xff;
+    }
   }
   return {
-    ...save,
-    version: 2,
-    pixels: rgb.toString("base64"),
-    history: save.history.map(entry => ({
+    version: 3,
+    width: CANVAS_WIDTH,
+    height: CANVAS_HEIGHT,
+    pixels: rgba.toString("base64"),
+    history: save.history.map((entry): HistoryEntry => ({
       ...entry,
-      color: paletteColor(entry.color),
-      previousColor: paletteColor(entry.previousColor),
+      x: entry.x + offset,
+      y: entry.y + offset,
+      color: toColor(entry.color),
+      previousColor: toColor(entry.previousColor),
     })),
   };
 }

@@ -22,6 +22,10 @@ export async function registerRealtime(
 ): Promise<void> {
   const transport = new WebSocketTransport({
     noServer: true,
+    // Compress large messages (the Canvas sent on join, mostly empty or flat
+    // color) without spending CPU on the small per-Placement ones. No context
+    // takeover keeps per-connection memory small.
+    perMessageDeflate: { threshold: 1024, serverNoContextTakeover: true, clientNoContextTakeover: true },
     beforeUpgrade: (_request, context) => {
       // Same rule as the HTTP CORS check: browsers always send Origin, so only a
       // non-browser client (tests, scripts) arrives without one. Cooldown, not

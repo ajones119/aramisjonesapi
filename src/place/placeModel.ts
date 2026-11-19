@@ -18,18 +18,24 @@ export const LEGACY_PALETTE = [
   "#0083C7", "#0000EA", "#CF6EE4", "#820080",
 ] as const;
 
-export const CANVAS_WIDTH = 128;
-export const CANVAS_HEIGHT = 128;
+export const CANVAS_WIDTH = 256;
+export const CANVAS_HEIGHT = 256;
 
-/** Colors are 24-bit RGB numbers (0xRRGGBB). An empty Canvas is white. */
+/**
+ * Colors are 24-bit RGB numbers (0xRRGGBB). EMPTY marks a Pixel nobody has
+ * painted, which the page draws transparent so it matches light or dark mode.
+ * Visitors only place real colors; EMPTY appears when a revert restores a
+ * Pixel to unpainted.
+ */
 export const WHITE = 0xFFFFFF;
 export const MAX_COLOR = 0xFFFFFF;
+export const EMPTY = -1;
 
 export interface CanvasSnapshot {
   palette: readonly string[];
   width: number;
   height: number;
-  /** Three bytes (R, G, B) per Pixel, row-major. */
+  /** Four bytes (R, G, B, A) per Pixel, row-major. A is 255 for a painted Pixel and 0 for an empty one. */
   pixels: Uint8Array;
   nextAllowedAt: number;
   serverNow: number;
@@ -87,10 +93,10 @@ export interface HistoryEntry {
 
 /** What survives a restart: the Canvas and Placement History, never Cooldowns. */
 export interface PlaceSave {
-  version: 2;
+  version: 3;
   width: number;
   height: number;
-  /** The Canvas as RGB bytes, base64. */
+  /** The Canvas as RGBA bytes, base64. */
   pixels: string;
   history: HistoryEntry[];
 }
@@ -132,7 +138,7 @@ export function createPlaceModel({
   now = Date.now,
   saved,
 }: PlaceModelOptions): PlaceModel {
-  const pixels = new Uint8Array(CANVAS_WIDTH * CANVAS_HEIGHT * 3).fill(0xff);
+  const pixels = new Uint8Array(CANVAS_WIDTH * CANVAS_HEIGHT * 4);
   if (saved) pixels.set(Buffer.from(saved.pixels, "base64"));
   const visitorCooldowns = new Map<string, number>();
   const networkPlacements = new Map<string, number[]>();
@@ -142,7 +148,8 @@ export function createPlaceModel({
   const listeners = new Set<(placement: Placement) => void>();
 
   function colorAt(x: number, y: number): number {
-    const i = (y * CANVAS_WIDTH + x) * 3;
+    const i = (y * CANVAS_WIDTH + x) * 4;
+    if (pixels[i + 3] === 0) return EMPTY;
     return (pixels[i] << 16) | (pixels[i + 1] << 8) | pixels[i + 2];
   }
 
@@ -150,10 +157,15 @@ export function createPlaceModel({
   function paint(placement: Placement, visitorHash: string, networkHash: string, at: number): void {
     const { x, y, color } = placement;
     const previousColor = colorAt(x, y);
-    const i = (y * CANVAS_WIDTH + x) * 3;
-    pixels[i] = color >> 16;
-    pixels[i + 1] = (color >> 8) & 0xff;
-    pixels[i + 2] = color & 0xff;
+    const i = (y * CANVAS_WIDTH + x) * 4;
+    if (color === EMPTY) {
+      pixels.fill(0, i, i + 4);
+    } else {
+      pixels[i] = color >> 16;
+      pixels[i + 1] = (color >> 8) & 0xff;
+      pixels[i + 2] = color & 0xff;
+      pixels[i + 3] = 0xff;
+    }
     history.push({ x, y, color, previousColor, visitorHash, networkHash, at });
     if (history.length > HISTORY_CAPACITY) history.shift();
     changeCount++;
@@ -277,7 +289,7 @@ export function createPlaceModel({
     },
     serialize() {
       return {
-        version: 2,
+        version: 3,
         width: CANVAS_WIDTH,
         height: CANVAS_HEIGHT,
         pixels: Buffer.from(pixels).toString("base64"),
