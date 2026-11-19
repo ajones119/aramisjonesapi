@@ -10,3 +10,10 @@ try {
   app.log.error(error);
   process.exitCode = 1;
 }
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    app.log.info(`${signal} received, shutting down`);
+    void app.close().finally(() => process.exit(0));
+  });
+}

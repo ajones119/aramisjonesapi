@@ -10,6 +10,8 @@
     "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
+    "@colyseus/core": "^0.18.29",
+    "@colyseus/ws-transport": "^0.18.5",
     "@fastify/cors": "latest",
     "@fastify/swagger": "latest",
     "@fastify/swagger-ui": "latest",
@@ -20,8 +22,11 @@
     "zod": "latest"
   },
   "devDependencies": {
+    "@colyseus/sdk": "^0.18.10",
     "@types/node": "latest",
+    "@types/ws": "^8.18.2",
     "tsx": "latest",
-    "typescript": "latest"
+    "typescript": "latest",
+    "ws": "^8.23.0"
   }
 }

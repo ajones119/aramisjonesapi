@@ -13,9 +13,14 @@ import { config, type Config } from "./config.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerJevRoute } from "./routes/jev.js";
 import { registerSoundscapeRoute } from "./routes/soundscape.js";
+import { registerRealtime } from "./realtime.js";
 
-export async function buildApp(runtimeConfig: Config = config) {
-  const app = Fastify({ logger: true, trustProxy: runtimeConfig.trustProxy }).withTypeProvider<ZodTypeProvider>();
+export interface BuildAppOptions {
+  logger?: boolean;
+}
+
+export async function buildApp(runtimeConfig: Config = config, { logger = true }: BuildAppOptions = {}) {
+  const app = Fastify({ logger, trustProxy: runtimeConfig.trustProxy }).withTypeProvider<ZodTypeProvider>();
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
@@ -58,6 +63,7 @@ export async function buildApp(runtimeConfig: Config = config) {
 
   await registerHealthRoute(app);
   await registerSoundscapeRoute(app, runtimeConfig);
+  await registerRealtime(app, runtimeConfig);
   if (runtimeConfig.nodeEnv !== "production") {
     await registerJevRoute(app, runtimeConfig);
   }
