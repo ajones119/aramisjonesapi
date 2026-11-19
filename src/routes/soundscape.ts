@@ -10,6 +10,7 @@ import {
 import type { EntryType, ScoreResponse } from "@typesafe-ai/sdk";
 import { z } from "zod";
 import type { Config } from "../config.js";
+import { FixedWindowRateLimiter } from "../rateLimiter.js";
 import {
   SoundscapeCatalogError,
   SOUNDSCAPE_SELECTION_THRESHOLD,
@@ -17,6 +18,7 @@ import {
   loadSoundscapeSounds,
   type SoundDefinition,
 } from "../soundscapeConfig.js";
+import { TimedCache } from "../timedCache.js";
 
 const sceneDescriptionSchema = z.string().trim().min(1).max(1000);
 const limitsSchema = z.record(z.string().trim().min(1), z.number().int().min(0).max(20));
@@ -34,6 +36,33 @@ interface MatchResult {
   selected: boolean;
 }
 
+interface TagMatch {
+  tag: string;
+  probability: number;
+  selected: boolean;
+}
+
+interface SoundMatch extends MatchResult {
+  id: string;
+  category: string;
+}
+
+interface VolumeMatch {
+  id: string;
+  score: number;
+  level: number;
+  label: VolumeLabel;
+}
+
+interface SoundscapeResolveResponse {
+  selectedSoundIds: string[];
+  tagMatches: TagMatch[];
+  soundMatches: SoundMatch[];
+  unknownCategories: string[];
+  soundLevels: Record<string, number>;
+  volumeMatches: VolumeMatch[];
+}
+
 type VolumeLabel = "silent" | "subtle" | "present" | "strong" | "foreground";
 
 const VOLUME_RUBRIC = [
@@ -43,6 +72,29 @@ const VOLUME_RUBRIC = [
   "strong: prominent and attention-holding, but not the main foreground layer",
   "foreground: the nearest or most important layer, clearly dominant",
 ] as const;
+
+const SOUNDSCAPE_RATE_LIMIT = 30;
+const SOUNDSCAPE_RATE_WINDOW_MS = 10 * 60 * 1000;
+const SOUNDSCAPE_RESOLUTION_TTL_MS = 10 * 60 * 1000;
+const SOUNDSCAPE_RESOLUTION_CACHE_MAX_ENTRIES = 500;
+
+export function resolutionCacheKey(sceneDescription: string, limits: Record<string, number>): string {
+  const normalizedScene = sceneDescription.trim().replace(/\s+/g, " ").toLowerCase();
+  const normalizedLimits = Object.fromEntries(
+    Object.entries(limits).sort(([left], [right]) => left.localeCompare(right)),
+  );
+  return JSON.stringify({ scene: normalizedScene, limits: normalizedLimits });
+}
+
+function setRateLimitHeaders(reply: { header(name: string, value: string | number): unknown }, decision: {
+  limit: number;
+  remaining: number;
+  resetAt: number;
+}): void {
+  reply.header("X-RateLimit-Limit", decision.limit);
+  reply.header("X-RateLimit-Remaining", decision.remaining);
+  reply.header("X-RateLimit-Reset", Math.ceil(decision.resetAt / 1000));
+}
 
 function volumeLevel(scoreValue: number): { score: number; level: number; label: VolumeLabel } {
   const score = Math.min(4, Math.max(0, scoreValue));
@@ -96,6 +148,14 @@ function selectByCategory(
 
 export async function registerSoundscapeRoute(app: FastifyInstance, config: Config): Promise<void> {
   const client = new TypeSafeClient({ apiKey: config.typesafeApiKey });
+  const rateLimiter = new FixedWindowRateLimiter({
+    limit: SOUNDSCAPE_RATE_LIMIT,
+    windowMs: SOUNDSCAPE_RATE_WINDOW_MS,
+  });
+  const resolutionCache = new TimedCache<SoundscapeResolveResponse>({
+    ttlMs: SOUNDSCAPE_RESOLUTION_TTL_MS,
+    maxEntries: SOUNDSCAPE_RESOLUTION_CACHE_MAX_ENTRIES,
+  });
 
   app.get("/api/soundscape/config", {
     schema: {
@@ -118,6 +178,15 @@ export async function registerSoundscapeRoute(app: FastifyInstance, config: Conf
       summary: "Resolve a scene into a bounded sound selection",
       body: resolveSchema,
     },
+    preHandler: async (request, reply) => {
+      const decision = rateLimiter.consume(request.ip);
+      setRateLimitHeaders(reply, decision);
+      if (decision.allowed) return;
+
+      const retryAfterSeconds = Math.max(1, Math.ceil((decision.resetAt - Date.now()) / 1000));
+      reply.header("Retry-After", retryAfterSeconds);
+      return reply.code(429).send({ error: "rate limit exceeded", retryAfterSeconds });
+    },
   }, async (request, reply) => {
     const startedAt = performance.now();
     const elapsedMs = () => Math.round(performance.now() - startedAt);
@@ -132,6 +201,12 @@ export async function registerSoundscapeRoute(app: FastifyInstance, config: Conf
     });
 
     try {
+      const cachedResponse = resolutionCache.get(resolutionCacheKey(sceneDescription, limits));
+      if (cachedResponse) {
+        logStep("resolution cache hit", { selectedSoundCount: cachedResponse.selectedSoundIds.length });
+        return reply.code(200).send(cachedResponse);
+      }
+
       const catalogStartedAt = performance.now();
       const sounds = await loadSoundscapeSounds(config);
       logStep("catalog loaded", {
@@ -171,15 +246,17 @@ export async function registerSoundscapeRoute(app: FastifyInstance, config: Conf
       });
 
       if (!candidates.length) {
-        logStep("no candidate sounds; returning", { totalDurationMs: elapsedMs() });
-        return reply.code(200).send({
+        const response: SoundscapeResolveResponse = {
           selectedSoundIds: [],
           tagMatches,
           soundMatches: [],
           unknownCategories: Object.keys(limits).filter((category) => !sounds.some((sound) => sound.category === category)),
           soundLevels: {},
           volumeMatches: [],
-        });
+        };
+        resolutionCache.set(resolutionCacheKey(sceneDescription, limits), response);
+        logStep("no candidate sounds; returning", { totalDurationMs: elapsedMs() });
+        return reply.code(200).send(response);
       }
 
       const soundQuestions = Object.fromEntries(candidates.map((sound) => [
@@ -269,14 +346,16 @@ export async function registerSoundscapeRoute(app: FastifyInstance, config: Conf
         selectedSoundCount: selectedSoundIds.length,
         totalDurationMs: elapsedMs(),
       });
-      return reply.code(200).send({
+      const response: SoundscapeResolveResponse = {
         selectedSoundIds,
         tagMatches,
         soundMatches,
         unknownCategories: Object.keys(limits).filter((category) => !sounds.some((sound) => sound.category === category)),
         soundLevels,
         volumeMatches,
-      });
+      };
+      resolutionCache.set(resolutionCacheKey(sceneDescription, limits), response);
+      return reply.code(200).send(response);
     } catch (error) {
       logStep("request failed", { totalDurationMs: elapsedMs() });
       if (error instanceof SoundscapeCatalogError) {

@@ -15,7 +15,7 @@ import { registerJevRoute } from "./routes/jev.js";
 import { registerSoundscapeRoute } from "./routes/soundscape.js";
 
 export async function buildApp(runtimeConfig: Config = config) {
-  const app = Fastify({ logger: true }).withTypeProvider<ZodTypeProvider>();
+  const app = Fastify({ logger: true, trustProxy: runtimeConfig.trustProxy }).withTypeProvider<ZodTypeProvider>();
 
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);

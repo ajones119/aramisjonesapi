@@ -57,7 +57,7 @@ const soundRowSchema = z.object({
 });
 
 const soundRowsSchema = z.array(soundRowSchema);
-const SOUNDSCAPE_CACHE_TTL_MS = 2 * 60 * 1000;
+const SOUNDSCAPE_CACHE_TTL_MS = 10 * 60 * 1000;
 const soundscapeCache = new Map<string, { sounds: SoundDefinition[]; expiresAt: number }>();
 const soundscapeRequests = new Map<string, Promise<SoundDefinition[]>>();
 
