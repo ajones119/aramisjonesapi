@@ -13,7 +13,8 @@ import { config, type Config } from "./config.js";
 import { registerHealthRoute } from "./routes/health.js";
 import { registerJevRoute } from "./routes/jev.js";
 import { createPlaceModel } from "./place/placeModel.js";
-import { loadPlace, startPlaceSaver } from "./place/placeStore.js";
+import { diskBackend, loadPlace, startPlaceSaver } from "./place/placeStore.js";
+import { supabaseBackend } from "./place/supabaseSaveBackend.js";
 import { registerPlaceAdminRoutes } from "./routes/placeAdmin.js";
 import { registerPlaceDebugRoutes } from "./routes/placeDebug.js";
 import { registerPlaceSessionRoute } from "./routes/placeSession.js";
@@ -23,11 +24,14 @@ import { registerRealtime } from "./realtime.js";
 export interface BuildAppOptions {
   logger?: boolean;
   now?: () => number;
+  /** Startup read retry budget; short windows keep integration tests fast. */
+  placeReadRetryMs?: number;
+  placeSaveIntervalMs?: number;
 }
 
 export async function buildApp(
   runtimeConfig: Config = config,
-  { logger = true, now = Date.now }: BuildAppOptions = {},
+  { logger = true, now = Date.now, placeReadRetryMs = 60_000, placeSaveIntervalMs }: BuildAppOptions = {},
 ) {
   const app = Fastify({ logger, trustProxy: runtimeConfig.trustProxy }).withTypeProvider<ZodTypeProvider>();
 
@@ -74,13 +78,23 @@ export async function buildApp(
   await registerHealthRoute(app);
   await registerPlaceSessionRoute(app, runtimeConfig);
   await registerSoundscapeRoute(app, runtimeConfig);
+  const placeBackend = runtimeConfig.supabaseSecretKey
+    ? supabaseBackend(runtimeConfig.supabaseUrl, runtimeConfig.supabaseSecretKey)
+    : diskBackend(runtimeConfig.placeDataDir, now);
+  let saved;
+  try {
+    saved = await loadPlace(placeBackend, app.log, runtimeConfig.supabaseSecretKey ? placeReadRetryMs : 0);
+  } catch (error) {
+    await app.close();
+    throw error;
+  }
   const placeModel = createPlaceModel({
     cooldownMs: runtimeConfig.placeCooldownSeconds * 1_000,
     networkCap: runtimeConfig.placeNetworkCap,
     now,
-    saved: await loadPlace(runtimeConfig.placeDataDir, app.log, now),
+    saved,
   });
-  const placeSaver = startPlaceSaver(placeModel, runtimeConfig.placeDataDir, app.log);
+  const placeSaver = startPlaceSaver(placeModel, placeBackend, app.log, placeSaveIntervalMs);
   app.addHook("onClose", () => placeSaver.flush());
   await registerRealtime(app, runtimeConfig, placeModel);
   if (runtimeConfig.placeAdminToken) {

@@ -5,7 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 import { Client, type Room } from "@colyseus/sdk";
 import WebSocket from "ws";
-import { buildApp } from "../app.js";
+import Fastify from "fastify";
+import { gzipSync, gunzipSync } from "node:zlib";
+import { buildApp, type BuildAppOptions } from "../app.js";
 import type { Config } from "../config.js";
 import type { CanvasSnapshot } from "./placeModel.js";
 
@@ -62,8 +64,9 @@ async function startApi(
   runtimeConfig: Config = testConfig,
   now: () => number = Date.now,
   placeDataDir = newDataDir(),
+  options: BuildAppOptions = {},
 ) {
-  const app = await buildApp({ ...runtimeConfig, placeDataDir }, { logger: false, now });
+  const app = await buildApp({ ...runtimeConfig, placeDataDir }, { logger: false, now, ...options });
   await app.listen({ host: "127.0.0.1", port: 0 });
   const address = app.server.address();
   if (!address || typeof address === "string") throw new Error("API did not bind a port");
@@ -743,5 +746,196 @@ test("a 128×128 save file from the RGB era loads centered, with white Pixels tu
     await room.leave();
   } finally {
     await app.close();
+  }
+});
+
+
+const SAVE_SECRET = "test-server-only-secret";
+
+/** The external PostgREST boundary, with no real project or credentials involved. */
+async function fakePlaceStore() {
+  const server = Fastify();
+  const rows = new Map<number, string>();
+  const state = { failing: false, reads: 0, writes: 0, holdWrite: undefined as Promise<void> | undefined, holdRead: undefined as Promise<void> | undefined, failBackup: false };
+  server.addHook("preHandler", async (request, reply) => {
+    assert.equal(request.headers.apikey, SAVE_SECRET);
+    assert.equal(request.headers.authorization, `Bearer ${SAVE_SECRET}`);
+    if (request.method === "GET") state.reads++;
+    else state.writes++;
+    if (state.failing) return reply.code(500).send({ error: "unavailable" });
+  });
+  server.get("/rest/v1/place_save", async request => {
+    assert.equal((request.query as Record<string, string>).id, "eq.1");
+    assert.equal((request.query as Record<string, string>).select, "save_gzip");
+    await state.holdRead;
+    return rows.has(1) ? [{ save_gzip: rows.get(1) }] : [];
+  });
+  server.post("/rest/v1/place_save", async (request, reply) => {
+    assert.equal(request.headers.prefer, "resolution=merge-duplicates");
+    await state.holdWrite;
+    const body = request.body as { id: number; save_gzip: string; saved_at: string };
+    assert.ok([1, 2].includes(body.id));
+    if (body.id === 2 && state.failBackup) return reply.code(500).send();
+    assert.ok(Number.isFinite(Date.parse(body.saved_at)));
+    rows.set(body.id, body.save_gzip);
+    return reply.code(201).send();
+  });
+  const url = await server.listen({ host: "127.0.0.1", port: 0 });
+  return { server, rows, state, config: { ...testConfig, supabaseUrl: url, supabaseSecretKey: SAVE_SECRET, placeAdminToken: ADMIN_TOKEN } };
+}
+
+test("Supabase restores the Canvas and Placement History after a restart", { timeout: 10_000 }, async t => {
+  const store = await fakePlaceStore();
+  const first = await startApi(store.config);
+  t.after(() => first.app.close());
+  const visitor = await joinVisitor(first.endpoint);
+  await placeAndWait(visitor.room, 3, 4, CUSTOM);
+  await placeAndWait(visitor.room, 255, 255, WHITE);
+  const history = (await admin(first.app, "GET", "/place/admin/placements")).json();
+  await visitor.room.leave();
+  await first.app.close();
+
+  const second = await startApi(store.config);
+  const restored = await joinVisitor(second.endpoint);
+  t.after(async () => { await restored.room.leave(); await second.app.close(); await store.server.close(); });
+  assert.equal(colorAt(restored.canvas, 3, 4), CUSTOM);
+  assert.equal(colorAt(restored.canvas, 255, 255), WHITE);
+  assert.equal(paintedPixels(restored.canvas), 2);
+  assert.deepEqual((await admin(second.app, "GET", "/place/admin/placements")).json(), history);
+  const { placements } = history as { placements: HistoryEntry[] };
+  assert.deepEqual((await admin(second.app, "POST", "/place/admin/revert", { visitorHash: placements[0].visitorHash })).json(), { restored: 2 });
+  await restored.room.leave();
+});
+
+
+test("Supabase startup failure retries, rejects buildApp, and never writes an empty Canvas", async t => {
+  const store = await fakePlaceStore();
+  t.after(() => store.server.close());
+  store.state.failing = true;
+  const options = { logger: false, placeReadRetryMs: 100 };
+  await assert.rejects(buildApp(store.config, options), /Could not load Place/);
+  assert.ok(store.state.reads > 1, "startup retries the read");
+  assert.equal(store.state.writes, 0);
+});
+
+
+async function waitUntil(check: () => boolean, message: string) {
+  const deadline = Date.now() + 2_000;
+  while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(check(), message);
+}
+
+test("failed and slow Supabase saves never block Placements, and a later tick saves all changes", { timeout: 10_000 }, async t => {
+  const store = await fakePlaceStore();
+  const first = await startApi(store.config, Date.now, newDataDir(), { placeSaveIntervalMs: 20 });
+  const visitor = await joinVisitor(first.endpoint);
+  const watcher = await joinVisitor(first.endpoint);
+  let release = () => {};
+  t.after(async () => {
+    release();
+    await Promise.all([visitor.room.leave(), watcher.room.leave()]);
+    await first.app.close();
+    await store.server.close();
+  });
+  store.state.failing = true;
+  const broadcast = nextMessage(watcher.room, "placed");
+  await placeAndWait(visitor.room, 1, 2, RED);
+  assert.deepEqual(await broadcast, { x: 1, y: 2, color: RED });
+  await waitUntil(() => store.state.writes >= 2, "failed saves are retried on timer ticks");
+  assert.equal(store.rows.size, 0);
+
+  store.state.holdWrite = new Promise<void>(resolve => { release = resolve; });
+  store.state.failing = false;
+  const attempts = store.state.writes;
+  await waitUntil(() => store.state.writes > attempts, "recovery starts a save");
+  const duringSlowSave = nextMessage(watcher.room, "placed");
+  await placeAndWait(visitor.room, 2, 2, BLUE);
+  assert.deepEqual(await duringSlowSave, { x: 2, y: 2, color: BLUE });
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(store.state.writes, attempts + 1, "ticks do not queue overlapping saves");
+  release();
+  store.state.holdWrite = undefined;
+  await waitUntil(() => {
+    const raw = store.rows.get(1);
+    return raw !== undefined && JSON.parse(gunzipSync(Buffer.from(raw, "base64")).toString()).history.length === 2;
+  }, "next tick saves changes made during the slow save, before shutdown");
+  const savedWrites = store.state.writes;
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(store.state.writes, savedWrites, "unchanged snapshots are not rewritten");
+  await Promise.all([visitor.room.leave(), watcher.room.leave()]);
+  await first.app.close();
+
+  const second = await startApi(store.config);
+  const restored = await joinVisitor(second.endpoint);
+  t.after(async () => { await restored.room.leave(); await second.app.close(); });
+  assert.equal(colorAt(restored.canvas, 1, 2), RED);
+  assert.equal(colorAt(restored.canvas, 2, 2), BLUE);
+});
+
+
+test("a missing Supabase row starts a new empty Place without writing", async t => {
+  const store = await fakePlaceStore();
+  const api = await startApi(store.config);
+  const visitor = await joinVisitor(api.endpoint);
+  t.after(async () => { await visitor.room.leave(); await api.app.close(); await store.server.close(); });
+  assert.ok(isEmptyCanvas(visitor.canvas));
+  assert.deepEqual((await admin(api.app, "GET", "/place/admin/placements")).json(), { placements: [] });
+  await visitor.room.leave();
+  await api.app.close();
+  assert.equal(store.state.writes, 0);
+});
+
+test("corrupt Supabase saves are preserved exactly in row 2 before starting an empty Canvas", async () => {
+  const invalidShape = JSON.stringify({ version: 3, width: SIZE, height: SIZE, pixels: "AAAA", history: [] });
+  for (const raw of [gzipSync("{ not json").toString("base64"), gzipSync(invalidShape).toString("base64"), "not valid gzip"]) {
+    const store = await fakePlaceStore();
+    store.rows.set(1, raw);
+    let api: Awaited<ReturnType<typeof startApi>> | undefined;
+    let visitor: Awaited<ReturnType<typeof joinVisitor>> | undefined;
+    try {
+      api = await startApi(store.config, Date.now, newDataDir(), { placeReadRetryMs: 50 });
+      visitor = await joinVisitor(api.endpoint);
+      assert.ok(isEmptyCanvas(visitor.canvas));
+      assert.equal(store.rows.get(2), raw, "the corrupt stored bytes are kept intact");
+      await placeAndWait(visitor.room, 8, 9, CUSTOM);
+      await visitor.room.leave();
+      await api.app.close();
+      assert.notEqual(store.rows.get(1), raw);
+      assert.equal(store.rows.get(2), raw, "a later valid save cannot overwrite the corrupt copy");
+    } finally {
+      await visitor?.room.leave();
+      await api?.app.close();
+      await store.server.close();
+    }
+  }
+});
+
+
+test("a stalled Supabase startup read obeys the retry deadline and never writes", async () => {
+  const store = await fakePlaceStore();
+  let release = () => {};
+  store.state.holdRead = new Promise<void>(resolve => { release = resolve; });
+  try {
+    const started = Date.now();
+    await assert.rejects(buildApp(store.config, { logger: false, placeReadRetryMs: 80 }), /Could not load Place/);
+    assert.ok(Date.now() - started < 1_000, "a stalled HTTP response cannot extend the retry window");
+    assert.equal(store.state.writes, 0);
+  } finally {
+    release();
+    await store.server.close();
+  }
+});
+
+test("Place refuses to start if a corrupt Supabase save cannot be preserved", async () => {
+  const store = await fakePlaceStore();
+  const corrupt = gzipSync("{ invalid JSON").toString("base64");
+  store.rows.set(1, corrupt);
+  store.state.failBackup = true;
+  try {
+    await assert.rejects(buildApp(store.config, { logger: false, placeReadRetryMs: 80 }));
+    assert.equal(store.rows.get(1), corrupt);
+    assert.equal(store.rows.has(2), false);
+  } finally {
+    await store.server.close();
   }
 });

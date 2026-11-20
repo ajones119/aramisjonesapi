@@ -16,6 +16,8 @@ const environmentSchema = z.object({
   PLACE_DATA_DIR: z.string().trim().min(1).default("data/place"),
   TYPESAFE_API_KEY: z.string().trim().min(1),
   SUPABASE_URL: z.string().trim().url(),
+  // When set, Place saves to Supabase instead of PLACE_DATA_DIR. Server-only.
+  SUPABASE_SECRET_KEY: z.string().trim().min(1).optional(),
   SUPABASE_PUBLISHABLE_KEY: z.string().trim().min(1),
 }).refine((env) => env.NODE_ENV !== "production" || env.PLACE_COOKIE_SECRET !== undefined, {
   path: ["PLACE_COOKIE_SECRET"],
@@ -38,7 +40,8 @@ export const config = {
   placeDataDir: values.PLACE_DATA_DIR,
   typesafeApiKey: values.TYPESAFE_API_KEY,
   supabaseUrl: values.SUPABASE_URL,
+  supabaseSecretKey: values.SUPABASE_SECRET_KEY,
   supabasePublishableKey: values.SUPABASE_PUBLISHABLE_KEY,
 } as const;
 
-export type Config = typeof config;
+export type Config = Omit<typeof config, "supabaseSecretKey"> & { supabaseSecretKey?: string };

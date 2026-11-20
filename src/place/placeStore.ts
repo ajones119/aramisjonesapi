@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import {
   CANVAS_HEIGHT, CANVAS_WIDTH, EMPTY, HISTORY_CAPACITY, LEGACY_PALETTE, MAX_COLOR, WHITE,
@@ -7,9 +8,7 @@ import {
 } from "./placeModel.js";
 
 /**
- * Interim disk persistence for Place (durable storage is a later ticket). The
- * Canvas and Placement History share one file so a single rename keeps them
- * consistent. Cooldowns are never saved.
+ * Snapshot persistence for the Canvas and Placement History. Cooldowns are never saved.
  */
 
 export const SAVE_FILE = "place.json";
@@ -97,56 +96,119 @@ function upgrade(save: z.infer<typeof anySave>): PlaceSave {
   };
 }
 
-/**
- * Reads the saved Place. A missing file means a fresh Canvas. A corrupt one is
- * renamed aside (so the next save cannot overwrite it) and Place starts empty.
- */
-export async function loadPlace(dataDir: string, log: Log, now = Date.now): Promise<PlaceSave | undefined> {
-  const file = join(dataDir, SAVE_FILE);
-  let text: string;
-  try {
-    text = await readFile(file, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
-  }
-  try {
-    const saved = upgrade(anySave.parse(JSON.parse(text)));
-    log.info(`Loaded the Place Canvas and ${saved.history.length} Placement History entries from ${file}`);
-    return saved;
-  } catch (error) {
-    const aside = `${file}.corrupt-${now()}`;
-    await rename(file, aside);
-    log.warn(`Place save file is corrupt; starting with an empty Canvas. Kept it at ${aside}: ${(error as Error).message}`);
-  }
+export interface SaveBackend {
+  /** JSON text, or undefined for a new Place. Unreachable storage must throw. */
+  read(signal?: AbortSignal): Promise<string | undefined>;
+  write(json: string): Promise<void>;
+  /** Keeps a corrupt save out of the way; returns where it went, for the log. */
+  setAside(json: string): Promise<string>;
 }
 
-/** Saves the model at most every `intervalMs` when it has changed, and on `flush()` (graceful shutdown). */
-export function startPlaceSaver(model: PlaceModel, dataDir: string, log: Log, intervalMs = SAVE_INTERVAL_MS) {
+/** Backend errors are written to be safe to log (no keys, headers or bodies). */
+const reason = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+export function diskBackend(dataDir: string, now = Date.now): SaveBackend {
   const file = join(dataDir, SAVE_FILE);
+  return {
+    async read() {
+      try {
+        return await readFile(file, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+    },
+    async write(json) {
+      await mkdir(dataDir, { recursive: true });
+      const temp = `${file}.tmp`;
+      await writeFile(temp, json);
+      await rename(temp, file);
+    },
+    async setAside() {
+      const aside = `${file}.corrupt-${now()}`;
+      await rename(file, aside);
+      return aside;
+    },
+  };
+}
+
+/** A read failure is fatal; only missing or successfully preserved corrupt saves start empty. */
+export async function loadPlace(backend: SaveBackend, log: Log, retryMs = 0): Promise<PlaceSave | undefined> {
+  const deadline = Date.now() + retryMs;
+  const signal = AbortSignal.timeout(Math.max(1, retryMs));
+  let backoff = Math.min(1_000, retryMs / 4);
+  let warned = false;
+  let text: string | undefined;
+  for (;;) {
+    try {
+      text = await backend.read(retryMs > 0 ? signal : undefined);
+      break;
+    } catch (error) {
+      if (Date.now() >= deadline) throw new Error(`Could not load Place; refusing to start with an empty Canvas. ${reason(error)}`);
+      if (!warned) {
+        log.warn(`Could not read Place; retrying before startup. ${reason(error)}`);
+        warned = true;
+      }
+      await delay(Math.min(backoff, deadline - Date.now()));
+      if (Date.now() >= deadline) throw new Error("Could not load Place; refusing to start with an empty Canvas.");
+      backoff = Math.min(backoff * 2, 10_000);
+    }
+  }
+  if (text === undefined) return;
+  let saved: PlaceSave;
+  try {
+    saved = upgrade(anySave.parse(JSON.parse(text)));
+  } catch (error) {
+    const aside = await backend.setAside(text);
+    log.warn(`Place save is corrupt; kept it at ${aside} and starting with an empty Canvas. ${reason(error)}`);
+    return;
+  }
+  log.info(`Loaded the Place Canvas and ${saved.history.length} Placement History entries`);
+  return saved;
+}
+
+/** Saves at most every interval when changed, and flushes on graceful shutdown. */
+export function startPlaceSaver(model: PlaceModel, backend: SaveBackend, log: Log, intervalMs = SAVE_INTERVAL_MS) {
   let savedChangeCount = model.changeCount;
   let saving: Promise<void> = Promise.resolve();
+  let pending = false;
+  let failing = false;
 
   function save(): Promise<void> {
+    pending = true;
     saving = saving.then(async () => {
       const changeCount = model.changeCount;
       if (changeCount === savedChangeCount) return;
-      await mkdir(dataDir, { recursive: true });
-      const temp = `${file}.tmp`;
-      await writeFile(temp, JSON.stringify(model.serialize()));
-      await rename(temp, file);
+      await backend.write(JSON.stringify(model.serialize()));
       savedChangeCount = changeCount;
-    }).catch((error: Error) => log.warn(`Could not save Place to ${file}: ${error.message}`));
+      failing = false;
+    }).catch((error: unknown) => {
+      if (!failing) log.warn(`Could not save Place; will retry on the next tick. ${reason(error)}`);
+      failing = true;
+    }).finally(() => { pending = false; });
     return saving;
   }
 
-  const timer = setInterval(() => void save(), intervalMs);
+  const timer = setInterval(() => { if (!pending) void save(); }, intervalMs);
   timer.unref();
 
   return {
     async flush(): Promise<void> {
       clearInterval(timer);
-      await save();
+      let cap: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          save(),
+          new Promise<void>(resolve => {
+            cap = setTimeout(() => {
+              log.warn("Place shutdown save exceeded 20 seconds; stopping the flush.");
+              resolve();
+            }, 20_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(cap);
+      }
     },
   };
 }
